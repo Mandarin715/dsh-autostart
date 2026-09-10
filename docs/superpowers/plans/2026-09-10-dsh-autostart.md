@@ -2171,7 +2171,7 @@ function defaultSpawnHelper() {
 - [ ] **Step 4: 跑测试,确认通过**
 
 Run: `node --test test/host-routes.test.js`
-Expected: PASS(6 tests)
+Expected: PASS(7 tests)(5 个原始路由用例 + VBS 编码用例 + 外来注册表项拒绝用例)
 
 - [ ] **Step 5: 语法检查**
 
