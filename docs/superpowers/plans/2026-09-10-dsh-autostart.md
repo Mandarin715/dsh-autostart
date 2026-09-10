@@ -969,7 +969,7 @@ export function parseConfigFile(text) {
 - [ ] **Step 4: 跑测试,确认通过**
 
 Run: `node --test test/config.test.js`
-Expected: PASS(8 tests)
+Expected: PASS(10 tests)(8 个原始用例 + 修复轮新增的 2 个:null/array command 与 command 字段校验)
 
 - [ ] **Step 5: 提交**
 
@@ -1164,7 +1164,7 @@ git commit -m "feat: add HKCU Run registry access with an injectable executor"
 - Consumes: `lib/config.js`(`parseConfigFile`)、`lib/port.js`(`isPortListening`, `waitForPort`)
 - Produces:
   - `readConfig(configPath: string): object`
-  - `spawnDsh(config: object, deps?: object): number` → 子进程 pid
+  - `spawnDsh(config: object, log?: Function): number` → 子进程 pid;`logPaths` 缺失时抛出明确错误
   - `runHook(config: object, log: Function, deps?: object): Promise<{ ran: boolean, code?: number, missing?: boolean }>`
   - `runStart(input: { config, log, deps? }): Promise<{ started: boolean, pid?: number, up?: boolean }>`
   - `main(argv: string[], deps?: object): Promise<number>`
@@ -1176,7 +1176,7 @@ git commit -m "feat: add HKCU Run registry access with an injectable executor"
 ```js
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { runStart, runHook, main } from '../service.js'
+import { runStart, runHook, spawnDsh, main } from '../service.js'
 
 function baseConfig(overrides = {}) {
   return {
@@ -1288,6 +1288,44 @@ test('main rejects an unknown mode', async () => {
   })
   assert.equal(code, 2)
 })
+
+test('spawnDsh refuses a config without log paths instead of throwing a raw TypeError', () => {
+  // Throws before touching the filesystem or spawning anything, so this test
+  // launches nothing.
+  assert.throws(
+    () => spawnDsh({ command: { execPath: 'node.exe', argv: ['b.js'], cwd: '.' }, logPaths: {} }),
+    /logPaths/,
+  )
+})
+
+test('runStart hands the logger to the spawner so a spawn failure is reportable', async () => {
+  let receivedLog = null
+  await runStart({
+    config: baseConfig(),
+    log: () => {},
+    deps: {
+      isPortListening: async () => false,
+      waitForPort: async () => true,
+      spawnDsh: (config, log) => {
+        receivedLog = log
+        return 11
+      },
+      runHook: async () => ({ ran: false }),
+    },
+  })
+  assert.equal(typeof receivedLog, 'function')
+})
+
+test('main returns 1 rather than rejecting when the start path throws', async () => {
+  const code = await main(['node', 'service.js', 'start'], {
+    configPath: 'test/fixtures/config.json',
+    isPortListening: async () => false,
+    spawnDsh: () => {
+      throw new Error('boom')
+    },
+  })
+  assert.equal(code, 1)
+})
 ```
 
 `test/fixtures/config.json`(本任务创建;Task 9 复用它,不重复创建):
@@ -1341,7 +1379,13 @@ export function readConfig(configPath) {
 }
 
 /** Launch DSH detached, with stdout/stderr appended to the log files. */
-export function spawnDsh(config) {
+export function spawnDsh(config, log = () => {}) {
+  // parseConfigFile does not validate logPaths (it cannot — it never receives
+  // dshHome), so guard it here: an unguarded openSync would throw a TypeError
+  // that escapes main's contract of returning an exit code.
+  if (typeof config?.logPaths?.out !== 'string' || typeof config?.logPaths?.err !== 'string') {
+    throw new Error('config: logPaths.out and logPaths.err are required to capture DSH output')
+  }
   const out = fs.openSync(config.logPaths.out, 'a')
   const err = fs.openSync(config.logPaths.err, 'a')
   const child = spawn(config.command.execPath, config.command.argv, {
@@ -1349,6 +1393,13 @@ export function spawnDsh(config) {
     detached: true,
     windowsHide: true,
     stdio: ['ignore', out, err],
+  })
+  // A bad execPath emits 'error'; with no listener Node rethrows it as an
+  // uncaught exception, killing this hidden login helper before it can report
+  // anything. Swallow it into the log and let the port wait below surface the
+  // failure as "did not come up".
+  child.once('error', (error) => {
+    log(`spawn error: ${error instanceof Error ? error.message : String(error)}`)
   })
   child.unref()
   return child.pid
@@ -1412,7 +1463,7 @@ export async function runStart(input) {
     log(`port ${config.dshPort} already running; skip start`)
     return { started: false }
   }
-  const pid = spawnImpl(config)
+  const pid = spawnImpl(config, log)
   log(`spawned dsh pid=${pid}`)
   const up = await wait(config.dshPort, { timeoutMs: config.startTimeoutMs })
   log(up ? `port ${config.dshPort} is up` : `WARN port ${config.dshPort} did not come up in time`)
@@ -1455,11 +1506,20 @@ export async function main(argv, deps = {}) {
     return 1
   }
   const log = makeLogger(config)
-  if (mode === 'start') {
-    await runStart({ config, log, deps })
-    return 0
+  // The mode dispatch runs inside a guard: spawnDsh and the logger touch the
+  // filesystem, and this function's contract is to RETURN an exit code. An
+  // unguarded throw would become an unhandled rejection in a hidden login
+  // process, which is invisible to the user.
+  try {
+    if (mode === 'start') {
+      await runStart({ config, log, deps })
+      return 0
+    }
+    return 2
+  } catch (error) {
+    log(`unexpected failure: ${error instanceof Error ? error.message : String(error)}`)
+    return 1
   }
-  return 2
 }
 
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : ''
@@ -1471,7 +1531,7 @@ if (invokedPath === path.resolve(SERVICE_JS)) {
 - [ ] **Step 4: 跑测试,确认通过**
 
 Run: `node --test test/service-start.test.js`
-Expected: PASS(7 tests)
+Expected: PASS(10 tests)
 
 - [ ] **Step 5: 提交**
 
@@ -1652,25 +1712,30 @@ export async function runRestart(input) {
 }
 ```
 
-把 `main` 里的模式分支替换为:
+把 `main` 里的模式分支替换为(保留 Task 8 已有的 `try`/`catch` 包裹,两个模式都在里面):
 
 ```js
   const log = makeLogger(config)
-  if (mode === 'start') {
-    await runStart({ config, log, deps })
-    return 0
-  }
-  if (mode === 'restart') {
-    const pidFlag = argv.indexOf('--pid')
-    const oldPid = pidFlag === -1 ? Number.NaN : Number(argv[pidFlag + 1])
-    if (!Number.isInteger(oldPid) || oldPid <= 0) {
-      log('restart requires --pid <number>')
-      return 2
+  try {
+    if (mode === 'start') {
+      await runStart({ config, log, deps })
+      return 0
     }
-    await runRestart({ config, oldPid, log, deps })
-    return 0
+    if (mode === 'restart') {
+      const pidFlag = argv.indexOf('--pid')
+      const oldPid = pidFlag === -1 ? Number.NaN : Number(argv[pidFlag + 1])
+      if (!Number.isInteger(oldPid) || oldPid <= 0) {
+        log('restart requires --pid <number>')
+        return 2
+      }
+      await runRestart({ config, oldPid, log, deps })
+      return 0
+    }
+    return 2
+  } catch (error) {
+    log(`unexpected failure: ${error instanceof Error ? error.message : String(error)}`)
+    return 1
   }
-  return 2
 ```
 
 - [ ] **Step 4: 跑测试,确认通过**
