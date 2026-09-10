@@ -288,6 +288,28 @@ export function createHandlers(deps) {
   }
 }
 
+/**
+ * Remove the autostart entry on plugin unload — but only if it is still ours,
+ * so an unrelated entry can never be deleted by accident.
+ */
+export function cleanupAutostart(deps) {
+  const dshHome = deps.dshHome ?? resolveDshHome()
+  const registry = deps.registry ?? { readRunValue, removeRunValue }
+  const vbsPath = path.join(configDir(dshHome), 'bootstrap.vbs')
+  let stored
+  try {
+    stored = registry.readRunValue()
+  } catch {
+    return
+  }
+  if (stored === null || !isOurEntry(stored, vbsPath)) return
+  try {
+    registry.removeRunValue()
+  } catch {
+    // best effort on unload
+  }
+}
+
 /** Cordis row entry: mount the four routes on the web server. */
 // `agents` must be injected and handed to createHandlers — without it the row
 // never supplies deps.agents, countRunningAgents always sees undefined and
@@ -314,6 +336,7 @@ export function apply(ctx, config) {
     ]
     return () => {
       for (const fn of dispose) fn()
+      cleanupAutostart({})
     }
   }, 'dsh-autostart: routes')
 }
