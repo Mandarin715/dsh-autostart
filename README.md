@@ -88,10 +88,16 @@ Because a browser reaching `https://derp.example.com` sends no port at all, the 
 allow-listed authorities** — the entry itself is the explicit opt-in, and the Origin/Host match still has to hold.
 Loopback keeps the strict port check.
 
-> **Changing this plugin's config disposes the plugin.** Adding `allowedHosts` (or editing any other field) causes DSH to
-> reload the plugin: the old instance is disposed, and **dispose removes the `DSH autostart` registry entry** it owns.
-> That is intentional — the entry must never outlive the plugin — but it means you have to **open the settings card and
-> enable autostart again** after any config change. Re-enabling is idempotent.
+> **Do config changes require re-enabling autostart? Yes — but not because of dispose.**
+> `hookScript`, `dshPort`, `waitForExitMs` and `startTimeoutMs` are **snapshotted into `config.json` when you click
+> Enable**, and the helper reads `config.json`, not the plugin's live config. So after changing them you **must open the
+> settings card and enable autostart again** (re-enabling is idempotent). Measured on a real install: changing
+> `hookScript` and only restarting the service left the old value in `config.json`, so the hook never ran.
+> `allowedHosts` is different — it only affects the plugin's route guard and takes effect on reload.
+>
+> **The registry entry does not disappear because you edited the config.** The plugin removes `DSH autostart` only when it
+> is genuinely uninstalled (evidence: its own `service.js` is gone); when DSH tears the plugin tree down for a reload or a
+> failed load, the entry is **kept**.
 
 ## Generated files
 
@@ -108,7 +114,15 @@ Loopback keeps the strict port check.
 
 1. **Disable boot autostart in the settings page first** (this removes the registry entry)
 
-   > If the plugin is uninstalled while the registry entry is still there, that entry points at a script that no longer exists. On `dispose` the plugin removes the entry **only when it still points at this plugin's `bootstrap.vbs`**; otherwise it leaves it alone.
+   > This step is **required**, not optional. Two reasons: (1) the registry entry points at
+   > `~/.dsh/dsh-autostart/bootstrap.vbs`, and that file and `config.json` live **outside** the plugin directory, so
+   > removing the plugin does not delete them; (2) `pnpm remove` **keeps** the `node_modules/dsh-autostart` symlink, so
+   > this plugin's `service.js` is still reachable — and that reachability is exactly the plugin's cleanup test. So
+   > **uninstalling without disabling first leaves a dead entry** (it runs once at login and fails silently). Deleting
+   > `DSH autostart` from `HKCU\...\Run` by hand afterwards works too.
+   >
+   > Note: Settings → Plugins has **no** uninstall button for this plugin (that page only manages plugins installed from
+   > the markets), so step 2's command line is the normal path.
 2. Remove the plugin: `dsh plugin --profile web remove dsh-autostart`
 3. To clean up completely, delete `~/.dsh/dsh-autostart/` by hand
 

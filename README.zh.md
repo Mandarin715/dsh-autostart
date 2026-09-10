@@ -85,10 +85,15 @@ dsh plugin --profile web add github:Mandarin715/dsh-autostart
 浏览器访问 `https://derp.example.com` 时 `Host` **不带端口**,因此对白名单里的权威**跳过**本地 `dshPort`
 校验——填进白名单本身就是显式授权,而 Origin 与 Host 的同源校验依然必须成立。回环地址仍保持严格端口校验。
 
-> **改动本插件的配置会导致插件被重新加载(dispose)。** 添加 `allowedHosts`(或改任何其他字段)会让 DSH
-> 重新加载插件:旧实例被 dispose,而 **dispose 会删掉它自己写的那条 `DSH autostart` 注册表项**。
-> 这是有意为之——那条自启项绝不能比插件活得更久——但代价是:**改完配置后必须回到设置页重新启用一次自启**。
-> 重复启用是幂等的。
+> **改配置后要不要重新启用自启?——要,但原因不是 dispose。**
+> `hookScript` / `dshPort` / `waitForExitMs` / `startTimeoutMs` 这些字段是在**「启用自启」时快照进
+> `config.json`** 的,而助手读的是 `config.json`、不是插件的实时配置。所以改了它们**必须回设置页
+> 重新点一次「启用自启」**才会生效(重复启用是幂等的)。真机实测过:改了 `hookScript` 却只重启服务,
+> `config.json` 里仍是旧值,钩子不会执行。
+> 而 `allowedHosts` 只影响插件的路由守卫,重载即生效,与自启无关。
+>
+> **注册表项不会因为改配置而消失。** 插件只在自己**真的被卸载**时(判据:本插件的 `service.js`
+> 已不存在)才移除 `DSH autostart`;DSH 因重载或加载失败而拆解插件树时**保留**它。
 
 ## 生成物位置
 
@@ -105,7 +110,14 @@ dsh plugin --profile web add github:Mandarin715/dsh-autostart
 
 1. **先在设置页停用开机自启**(会删除注册表项)
 
-   > 若插件被卸载而注册表项仍在,该项会指向一个已不存在的脚本。插件在 `dispose` 时会**仅在注册表项仍指向本插件的 `bootstrap.vbs` 时**清理它;其他情况不动。
+   > 这一步是**必需**的,不是可选的。原因有两条:①注册表项指向 `~/.dsh/dsh-autostart/bootstrap.vbs`,
+   > 而它与 `config.json` 都在插件目录**之外**,卸载不会删;②`pnpm remove` 会**保留**
+   > `node_modules/dsh-autostart` 这条符号链接,于是本插件的 `service.js` 依然可达 —— 而插件的清理
+   > 判据正是"`service.js` 是否还存在"。所以**只卸载而不先停用,会留下一条死条目**(开机跑一次、
+   > 静默失败)。也可以卸载后手工删掉 `HKCU\...\Run` 里的 `DSH autostart`。
+   >
+   > 顺带一提:设置页的「设置 → 插件」**没有**本插件的卸载按钮(那一页只管理从市场安装的插件),
+   > 所以第 2 步的命令行是正常路径。
 2. 卸载插件:`dsh plugin --profile web remove dsh-autostart`
 3. 如需彻底清理,手动删除 `~/.dsh/dsh-autostart/` 目录
 
