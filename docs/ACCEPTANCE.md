@@ -29,7 +29,7 @@
 | —— `accessUrl` 刷新 | **通过** | 重启后 `state.accessUrl` 从旧 token 变为 `http://127.0.0.1:3080/?token=XfnRWbASvVAOxGev2pTyhBC76E4W_np_I2RPSFbUpls`,与插件自己捕获的日志一致 |
 | M4/M6 无控制台窗口 | **通过(修复后)** | 首测**失败**(见发现 F6);修复后连续两次真实重启,用户确认**均没有新窗口出现**;自动化枚举亦显示可见控制台窗口数只减不增 |
 | M5 钩子失败不阻断 | **通过** | `hookScript` 指向不存在路径后重启,`service.log` 末行 `hook not found: C:\definitely\missing\hook.ps1`,而 DSH **正常起来**并在 3080 监听 |
-| M7 卸载清理 | **未通过 UI 验证** | `dispose → cleanupAutostart` 确实会删除条目(见下方事件中实际观察到),但"从 UI 卸载插件"这一步未由 agent 执行 |
+| M7 卸载清理 | **通过(走 CLI,非 UI)** | 见下节「M7 实做记录」。UI 无卸载入口 —— 「设置 → 插件」只管理市场安装的插件,不提供手工 `link:` 依赖的卸载 |
 
 ### 额外验证(计划书之外的,但直接影响可用性)
 
@@ -130,6 +130,27 @@ $r = ([wmiclass]'Win32_Process').Create('<cmdline>', $null, $startup)
 "需要先由它生成 config.json" —— 而那个文件确实存在(本次验收收尾时正处于这个状态:卡片显示
 `开机自启: 未启用` 并要求启用,但重启其实是可用的)。建议按 `config.json` 是否存在来禁用,
 或让提示文案与真实条件一致。
+
+### M7 实做记录(CLI 卸载 + 手工清理)
+
+**界面里没有卸载入口**:用户确认「设置 → 插件」中找不到卸载按钮 —— 该页只管理从市场安装的插件,
+对 `dsh plugin --profile web add <本地路径>`(等价于 profile 里的一条 `link:` 依赖)不提供卸载。
+因此 M7 走 CLI。
+
+执行顺序(**先停用自启,再卸载**),每一步的结果:
+
+| 步骤 | 结果 |
+|---|---|
+| 点「停用自启」 | `{"enabled":false}`;注册表 `DSH autostart` 消失;用户原有四条不动 |
+| `dsh plugin --profile web remove dsh-autostart` | `dependencies` 中移除 ✅;`dsh.profile.bundles` 中**也**移除 ✅(关键:bundle 若残留,DSH 下次启动会因找不到模块而**启动失败**) |
+| 残留检查 | `node_modules\dsh-autostart` **仍作为符号链接存在**(→ 仓库,`service.js` 仍可达);用 `cmd /c rmdir` 只删链接(**不用 `Remove-Item -Recurse`:PowerShell 5.1 对重解析点有递归进目标删除的历史问题,而这个链接指向用户的仓库**)。删除前后仓库均为 85 个文件、`git clean`,`index.js`/`service.js` 完好 |
+| 生成数据 | `~/.dsh/dsh-autostart/`(config.json / bootstrap.vbs / 三个日志)需**手工删除**,卸载不会清 |
+
+**由此确认的 F3 边界(本次未踩到,因为先停用了)**:`pnpm remove` **保留**了符号链接,
+所以 `service.js` 依然可达 —— 若**只卸载、不停用**,按 F3 的判据(`service.js` 是否存在)
+`cleanupAutostart` 会**保留**那条注册表条目,留下一条死条目(开机跑一次、静默失败)。
+**结论:卸载前必须先「停用自启」**,或用 CLI/注册表编辑器手工删掉条目。
+建议后续把这条写进 README 的卸载一节。
 
 ## 验收后的处理(2026-09-10 当晚)
 
