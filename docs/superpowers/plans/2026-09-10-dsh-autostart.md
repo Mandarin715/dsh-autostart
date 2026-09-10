@@ -791,6 +791,20 @@ test('parseConfigFile rejects malformed input', () => {
   assert.throws(() => parseConfigFile('not json'), /config/)
   assert.throws(() => parseConfigFile('{}'), /command/)
 })
+
+test('parseConfigFile rejects a null or array command instead of passing it through', () => {
+  // typeof null === 'object', so without an explicit check a hand-edited
+  // config.json would hand service.js a null command and it would throw an
+  // unhandled TypeError inside spawn() rather than the designed clean exit.
+  assert.throws(() => parseConfigFile('{"command":null}'), /command/)
+  assert.throws(() => parseConfigFile('{"command":[]}'), /command/)
+})
+
+test('parseConfigFile rejects a command missing its own fields', () => {
+  assert.throws(() => parseConfigFile('{"command":{}}'), /command/)
+  assert.throws(() => parseConfigFile('{"command":{"execPath":"n","argv":["b"],"cwd":""}}'), /command/)
+  assert.throws(() => parseConfigFile('{"command":{"execPath":"n","argv":[],"cwd":"c"}}'), /command/)
+})
 ```
 
 - [ ] **Step 2: 跑测试,确认失败**
@@ -914,7 +928,22 @@ export function parseConfigFile(text) {
   if (parsed === null || typeof parsed !== 'object') {
     throw new Error('config: config.json must be a JSON object')
   }
-  if (parsed.command === undefined || typeof parsed.command !== 'object') {
+  // Mirror detectCommand's write-side validation: a command missing any of its
+  // three fields would reach spawn() as undefined and throw an unhandled
+  // TypeError instead of the designed clean exit.
+  const command = parsed.command
+  if (
+    command === undefined ||
+    command === null ||
+    Array.isArray(command) ||
+    typeof command !== 'object' ||
+    typeof command.execPath !== 'string' ||
+    command.execPath === '' ||
+    !Array.isArray(command.argv) ||
+    command.argv.length === 0 ||
+    typeof command.cwd !== 'string' ||
+    command.cwd === ''
+  ) {
     throw new Error('config: config.json is missing the command field')
   }
   const plugin = resolvePluginConfig({
