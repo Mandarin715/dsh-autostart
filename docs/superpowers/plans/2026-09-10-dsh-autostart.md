@@ -834,6 +834,17 @@ export const PLUGIN_DEFAULTS = {
   startTimeoutMs: 30000,
   openBrowserOnBoot: false,
   blockWhenAgentsRunning: false,
+  // Authorities allowed to reach the write routes besides loopback — for users
+  // who reach DSH through a trusted reverse proxy (frp + auth-proxy forwards
+  // the original Host, so the browser sends the public domain, not loopback).
+  allowedHosts: [],
+}
+
+function requireStringArray(value, field) {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string' || item === '')) {
+    throw new Error(`config: ${field} must be an array of non-empty strings`)
+  }
+  return value
 }
 
 function requirePort(value, field) {
@@ -872,6 +883,7 @@ export function resolvePluginConfig(raw = {}) {
     startTimeoutMs: requireDuration(merged.startTimeoutMs, 'startTimeoutMs'),
     openBrowserOnBoot: requireBoolean(merged.openBrowserOnBoot, 'openBrowserOnBoot'),
     blockWhenAgentsRunning: requireBoolean(merged.blockWhenAgentsRunning, 'blockWhenAgentsRunning'),
+    allowedHosts: requireStringArray(merged.allowedHosts, 'allowedHosts'),
   }
 }
 
@@ -1847,6 +1859,35 @@ test('sameOrigin enforces the expected port when one is given', () => {
   assert.equal(sameOrigin({ host: '127.0.0.1:9999', origin: 'http://127.0.0.1:9999' }, 3080), false)
 })
 
+test('sameOrigin admits an explicitly trusted reverse-proxy authority, and only that one', () => {
+  const allowed = ['derp.example.com']
+  // A user reaching DSH through frp + auth-proxy: the proxy forwards the
+  // original Host, so the browser sends the public domain rather than loopback.
+  assert.equal(
+    sameOrigin({ host: 'derp.example.com:3080', origin: 'http://derp.example.com:3080' }, 3080, allowed),
+    true,
+  )
+  // Trusting one authority must not open the door to another.
+  assert.equal(
+    sameOrigin({ host: 'evil.example:3080', origin: 'http://evil.example:3080' }, 3080, allowed),
+    false,
+  )
+  // The port and same-origin conditions still bind a trusted authority.
+  assert.equal(
+    sameOrigin({ host: 'derp.example.com:9999', origin: 'http://derp.example.com:9999' }, 3080, allowed),
+    false,
+  )
+  assert.equal(
+    sameOrigin({ host: 'derp.example.com:3080', origin: 'http://other.example:3080' }, 3080, allowed),
+    false,
+  )
+  // With no allow-list configured, the same request is refused.
+  assert.equal(
+    sameOrigin({ host: 'derp.example.com:3080', origin: 'http://derp.example.com:3080' }, 3080),
+    false,
+  )
+})
+
 test('enable refuses on an unsupported platform', async () => {
   const handlers = createHandlers({
     platform: 'linux',
@@ -2096,8 +2137,12 @@ export const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::
  *
  * @param expectedPort - the plugin's configured dshPort; when given, the Host
  *   must name exactly it.
+ * @param allowedHosts - extra authorities the user explicitly trusts, for
+ *   reaching DSH through a reverse proxy (frp + auth-proxy forwards the
+ *   original Host, so the browser sends the public domain, not loopback).
+ *   The port and same-origin checks still apply to these.
  */
-export function sameOrigin(headers, expectedPort) {
+export function sameOrigin(headers, expectedPort, allowedHosts = []) {
   const host = headers?.host
   const origin = headers?.origin
   if (typeof host !== 'string' || typeof origin !== 'string') return false
@@ -2109,7 +2154,10 @@ export function sameOrigin(headers, expectedPort) {
   } catch {
     return false
   }
-  if (!LOOPBACK_HOSTNAMES.has(hostUrl.hostname)) return false
+  const trusted = Array.isArray(allowedHosts)
+    ? allowedHosts.some((entry) => String(entry).toLowerCase() === hostUrl.host.toLowerCase())
+    : false
+  if (!LOOPBACK_HOSTNAMES.has(hostUrl.hostname) && !trusted) return false
   if (Number.isInteger(expectedPort) && hostUrl.port !== String(expectedPort)) return false
   return originUrl.host === hostUrl.host
 }
@@ -2171,7 +2219,7 @@ export function createHandlers(deps) {
       send(res, 400, { error: unsupportedReason(platform) })
       return false
     }
-    if (!sameOrigin(req.headers, pluginConfig.dshPort)) {
+    if (!sameOrigin(req.headers, pluginConfig.dshPort, pluginConfig.allowedHosts)) {
       send(res, 403, { error: 'same-origin request required' })
       return false
     }
@@ -2285,7 +2333,7 @@ function defaultSpawnHelper() {
 - [ ] **Step 4: 跑测试,确认通过**
 
 Run: `node --test test/host-routes.test.js`
-Expected: PASS(10 tests)(7 个原始用例 + 修复轮新增的 2 个 sameOrigin 用例 + 1 个 rebinding 拒绝用例)
+Expected: PASS(11 tests)(7 个原始用例 + 2 个 sameOrigin 用例 + 1 个 rebinding 拒绝用例 + 1 个 allowedHosts 用例)
 
 - [ ] **Step 5: 语法检查**
 
@@ -2887,6 +2935,7 @@ dsh plugin --profile web add github:Mandarin715/dsh-autostart
     startTimeoutMs: 30000
     openBrowserOnBoot: false       # true = 开机时自动打开浏览器
     blockWhenAgentsRunning: false  # true = 有 Agent 在跑时拒绝重启
+    allowedHosts: []               # 经反代访问时填你的域名,如 ['derp.example.com']
 ```
 
 ## 生成物位置
