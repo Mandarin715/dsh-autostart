@@ -10,6 +10,14 @@ import {
   removeRunValue,
 } from '../lib/registry.js'
 
+test('RUN_KEY and RUN_VALUE_NAME are pinned to their exact literals', () => {
+  // These are compared against the imported constants everywhere else, so a
+  // typo in the constant would keep the suite green while `reg add` quietly
+  // created a NEW key and reported success — autostart would do nothing.
+  assert.equal(RUN_KEY, 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run')
+  assert.equal(RUN_VALUE_NAME, 'DSH autostart')
+})
+
 test('registryCommand points wscript at the generated vbs', () => {
   assert.equal(
     registryCommand('C:\\Users\\me\\.dsh\\dsh-autostart\\bootstrap.vbs'),

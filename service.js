@@ -9,7 +9,6 @@
 // config.json and drives the OS, so it can be run by hand for debugging:
 //     node service.js start
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -63,6 +62,10 @@ function hookInvocation(script) {
 
 /**
  * Run the optional hook script. A hook failure NEVER blocks DSH startup.
+ *
+ * stderr is piped (not ignored) and appended to the log: §7 requires the exit
+ * code AND stderr to be recorded, and "hook exited code=1" on its own tells the
+ * user nothing about why their hook failed.
  */
 export function runHook(config, log, deps = {}) {
   const script = config.hookScript
@@ -72,12 +75,15 @@ export function runHook(config, log, deps = {}) {
     log(`hook not found: ${script}`)
     return Promise.resolve({ ran: false, missing: true })
   }
-  const spawnHook = deps.spawnHook ?? ((cmd, args) => spawn(cmd, args, { windowsHide: true, stdio: 'ignore' }))
+  const spawnHook =
+    deps.spawnHook ??
+    ((cmd, args, options = {}) =>
+      spawn(cmd, args, { windowsHide: true, stdio: options.stdio ?? ['ignore', 'ignore', 'pipe'] }))
   const [cmd, args] = hookInvocation(script)
   return new Promise((resolve) => {
     let child
     try {
-      child = spawnHook(cmd, args)
+      child = spawnHook(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'] })
     } catch (error) {
       log(`hook spawn error: ${error.message}`)
       resolve({ ran: true, failed: true })
@@ -87,8 +93,27 @@ export function runHook(config, log, deps = {}) {
       log(`hook error: ${error.message}`)
       resolve({ ran: true, failed: true })
     })
+    // Attach before 'close' resolves, so no stderr chunk is lost to the race
+    // between the stream ending and the process being reported closed.
+    let stderrText = ''
+    if (child.stderr !== undefined && child.stderr !== null) {
+      child.stderr.setEncoding?.('utf8')
+      child.stderr.on('data', (chunk) => {
+        stderrText += chunk
+      })
+    }
     child.once('close', (code) => {
       log(`hook exited code=${code}`)
+      // A failing hook must stay visible in the log without being able to break
+      // startup, so each non-empty line is logged separately and any error in
+      // the reading itself is swallowed.
+      try {
+        for (const line of stderrText.split(/\r?\n/)) {
+          if (line !== '') log(`hook stderr: ${line}`)
+        }
+      } catch {
+        // best effort: the hook failure is already recorded above
+      }
       resolve({ ran: true, code })
     })
   })
@@ -190,11 +215,15 @@ export async function main(argv, deps = {}) {
   try {
     config = readConfig(configPath)
   } catch (error) {
-    // At login there is no UI to report to: log and exit quietly.
+    // At login there is no UI to report to: log and exit quietly. The log must
+    // sit next to the config file (not at a path derived by rewriting the file
+    // name: for a config.json under any other name that rewrite is a no-op and
+    // would append the error into the config file itself).
     try {
-      fs.mkdirSync(path.dirname(configPath), { recursive: true })
+      const logPath = path.join(path.dirname(configPath), 'service.log')
+      fs.mkdirSync(path.dirname(logPath), { recursive: true })
       fs.appendFileSync(
-        configPath.replace(/config\.json$/, 'service.log'),
+        logPath,
         `[${new Date().toISOString()}] cannot read config: ${error.message}\n`,
         'utf8',
       )

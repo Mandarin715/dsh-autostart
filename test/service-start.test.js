@@ -1,5 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { runStart, runHook, spawnDsh, main } from '../service.js'
 
 function baseConfig(overrides = {}) {
@@ -104,6 +107,57 @@ test('runHook maps .ps1/.cmd/.bat to their interpreters', async () => {
   assert.deepEqual(seen[2], ['C:\\h\\c.exe', []])
 })
 
+test('runHook captures stderr into the log when the hook fails', async () => {
+  // §7 row 8: the exit code AND stderr must be recorded. "hook exited code=1"
+  // on its own tells the user nothing about why their hook failed.
+  const lines = []
+  const stdioSeen = []
+  const spawnHook = (cmd, args, options) => {
+    stdioSeen.push(options?.stdio)
+    return {
+      stderr: {
+        setEncoding: () => {},
+        on: (event, handler) => {
+          if (event === 'data') setImmediate(() => handler('boom: cannot start frpc\n'))
+        },
+      },
+      once(event, handler) {
+        if (event === 'close') setImmediate(() => handler(1))
+      },
+    }
+  }
+  const result = await runHook(
+    baseConfig({ hookScript: 'C:\\h\\after.ps1' }),
+    (line) => lines.push(line),
+    { exists: () => true, spawnHook },
+  )
+  assert.deepEqual(result, { ran: true, code: 1 })
+  // stderr is piped, not ignored — the reviewed defect.
+  assert.deepEqual(stdioSeen[0], ['ignore', 'ignore', 'pipe'])
+  const text = lines.join('\n')
+  assert.match(text, /hook exited code=1/)
+  assert.match(text, /hook stderr: boom: cannot start frpc/)
+})
+
+test('runHook resolves even when stderr cannot be read', async () => {
+  // A hook failure must never block DSH startup, so an unusable stderr stream
+  // is swallowed rather than rejecting the promise.
+  const lines = []
+  const spawnHook = () => ({
+    stderr: null,
+    once(event, handler) {
+      if (event === 'close') setImmediate(() => handler(3))
+    },
+  })
+  const result = await runHook(
+    baseConfig({ hookScript: 'C:\\h\\after.ps1' }),
+    (line) => lines.push(line),
+    { exists: () => true, spawnHook },
+  )
+  assert.deepEqual(result, { ran: true, code: 3 })
+  assert.match(lines.join('\n'), /hook exited code=3/)
+})
+
 test('main rejects an unknown mode', async () => {
   // 必须传 configPath:不传的话 main 会去读真实用户 home 的 config.json,
   // 既拿不到测试期望的返回码,还会在用户真实 ~/.dsh 下写一个 service.log。
@@ -149,4 +203,25 @@ test('main returns 1 rather than rejecting when the start path throws', async ()
     },
   })
   assert.equal(code, 1)
+})
+
+test('main writes service.log NEXT TO the config file when the config cannot be read', async () => {
+  // The old code derived the log path by rewriting `config.json` out of the
+  // config path: for any other file name that rewrite was a no-op and the error
+  // was appended INTO the config file. An isolated temp dir keeps this off the
+  // real ~/.dsh.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-test-'))
+  try {
+    const configPath = path.join(dir, 'renamed-config.json')
+    fs.writeFileSync(configPath, '{ not json', 'utf8')
+    const code = await main(['node', 'service.js', 'start'], { configPath })
+    assert.equal(code, 1)
+    const logPath = path.join(dir, 'service.log')
+    assert.equal(fs.existsSync(logPath), true)
+    assert.match(fs.readFileSync(logPath, 'utf8'), /cannot read config/)
+    // The config file itself is untouched.
+    assert.equal(fs.readFileSync(configPath, 'utf8'), '{ not json')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })

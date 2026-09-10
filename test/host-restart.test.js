@@ -19,25 +19,67 @@ const req = () => ({
   headers: { host: '127.0.0.1:3080', origin: 'http://127.0.0.1:3080' },
 })
 
-test('countRunningAgents counts only running agents', () => {
-  const agents = { list: () => [{ status: 'running' }, { status: 'idle' }, { status: 'running' }] }
-  assert.equal(countRunningAgents(agents), 2)
-  assert.equal(countRunningAgents(undefined), 0)
-  // A service object with no usable list() is "cannot be read", not "nothing is
-  // running" — see the unknown-state test below. Stale pre-amendment assertion.
-  assert.equal(countRunningAgents({}), null)
-})
-
-test('restart refuses while a restart is already scheduled', async () => {
-  const handlers = createHandlers({
+/**
+ * Handler deps that let the restart path reach the spawn step: the fs double
+ * reports config.json as present, and every dangerous seam is a throwing
+ * double so a regression cannot reach the real filesystem or exit anything.
+ */
+function restartDeps(overrides = {}) {
+  return {
     platform: 'win32',
     dshHome: 'C:\\dsh',
     execPath: 'node.exe',
     argv: ['bin.js', 'web'],
     cwd: 'C:\\work',
+    fs: { existsSync: () => true },
     spawnHelper: () => {},
     scheduleExit: () => {},
-  })
+    ...overrides,
+  }
+}
+
+test('countRunningAgents counts only running agents', () => {
+  const agents = { list: () => [{ status: 'running' }, { status: 'idle' }, { status: 'running' }] }
+  assert.equal(countRunningAgents(agents), 2)
+  // An absent service is "unknown", not "nothing is running" — see the
+  // unknown-state test below.
+  assert.equal(countRunningAgents(undefined), null)
+  assert.equal(countRunningAgents({}), null)
+})
+
+test('restart refuses with 400 and spawns nothing when config.json is missing', async () => {
+  // Without config.json, service.js restart cannot read the launch command: it
+  // logs, returns 1, and nothing starts DSH. Spawning the helper and exiting
+  // would therefore mean "restart" silently means "shut down".
+  let spawned = false
+  const handlers = createHandlers(
+    restartDeps({
+      // The throwing fs double: the guard must short-circuit before any write.
+      fs: {
+        existsSync: () => false,
+        writeFileSync: () => {
+          throw new Error('must not touch the filesystem')
+        },
+      },
+      agents: { list: () => [] },
+      spawnHelper: () => {
+        spawned = true
+        throw new Error('must not spawn')
+      },
+      scheduleExit: () => {
+        throw new Error('must not schedule an exit')
+      },
+    }),
+  )
+  const res = fakeRes()
+  await handlers.restart(req(), res)
+  assert.equal(res.statusCode, 400)
+  assert.match(res.body, /config\.json is missing/)
+  assert.equal(spawned, false)
+})
+
+test('restart refuses while a restart is already scheduled', async () => {
+  const handlers = createHandlers(restartDeps({ scheduleExit: () => {} }))
   const first = fakeRes()
   await handlers.restart(req(), first)
   assert.equal(first.statusCode, 202)
@@ -51,18 +93,15 @@ test('restart spawns the helper with the current pid', async () => {
   // Counted, not merely stubbed: spawning the helper is useless unless the exit
   // that lets it restart us is actually armed, so pin that call too.
   let exits = 0
-  const handlers = createHandlers({
-    platform: 'win32',
-    dshHome: 'C:\\dsh',
-    execPath: 'node.exe',
-    argv: ['bin.js', 'web'],
-    cwd: 'C:\\work',
-    currentPid: 4321,
-    spawnHelper: (deps) => calls.push(deps),
-    scheduleExit: () => {
-      exits += 1
-    },
-  })
+  const handlers = createHandlers(
+    restartDeps({
+      currentPid: 4321,
+      spawnHelper: (deps) => calls.push(deps),
+      scheduleExit: () => {
+        exits += 1
+      },
+    }),
+  )
   const res = fakeRes()
   await handlers.restart(req(), res)
   assert.equal(res.statusCode, 202)
@@ -71,21 +110,28 @@ test('restart spawns the helper with the current pid', async () => {
   assert.equal(exits, 1)
 })
 
+test('restart still accepts with runningAgents null when the gate is off', async () => {
+  // The default config has blockWhenAgentsRunning false, and an absent `agents`
+  // service now counts as "unknown". That must not break the accepted path.
+  const handlers = createHandlers(restartDeps({ agents: undefined }))
+  const res = fakeRes()
+  await handlers.restart(req(), res)
+  assert.equal(res.statusCode, 202)
+  assert.equal(JSON.parse(res.body).runningAgents, null)
+})
+
 test('restart returns 500 and schedules no exit when the helper fails to spawn', async () => {
   let exits = 0
-  const handlers = createHandlers({
-    platform: 'win32',
-    dshHome: 'C:\\dsh',
-    execPath: 'node.exe',
-    argv: ['bin.js', 'web'],
-    cwd: 'C:\\work',
-    spawnHelper: () => {
-      throw new Error('spawn boom')
-    },
-    scheduleExit: () => {
-      exits += 1
-    },
-  })
+  const handlers = createHandlers(
+    restartDeps({
+      spawnHelper: () => {
+        throw new Error('spawn boom')
+      },
+      scheduleExit: () => {
+        exits += 1
+      },
+    }),
+  )
   const res = fakeRes()
   await handlers.restart(req(), res)
   assert.equal(res.statusCode, 500)
@@ -93,20 +139,16 @@ test('restart returns 500 and schedules no exit when the helper fails to spawn',
 })
 
 test('restart blocks when agents are running and the guard is on', async () => {
-  const handlers = createHandlers({
-    platform: 'win32',
-    dshHome: 'C:\\dsh',
-    config: { blockWhenAgentsRunning: true },
-    execPath: 'node.exe',
-    argv: ['bin.js', 'web'],
-    cwd: 'C:\\work',
-    agents: { list: () => [{ status: 'running' }] },
-    spawnHelper: () => {},
-    // Returning 409 already short-circuits today, but if the gate ever regressed
-    // the default setTimeout(() => process.exit(0)) would arm a real exit and
-    // kill the test runner — so inject a no-op.
-    scheduleExit: () => {},
-  })
+  const handlers = createHandlers(
+    restartDeps({
+      config: { blockWhenAgentsRunning: true },
+      agents: { list: () => [{ status: 'running' }] },
+      // Returning 409 already short-circuits today, but if the gate ever regressed
+      // the default setTimeout(() => process.exit(0)) would arm a real exit and
+      // kill the test runner — so inject a no-op.
+      scheduleExit: () => {},
+    }),
+  )
   const res = fakeRes()
   await handlers.restart(req(), res)
   assert.equal(res.statusCode, 409)
@@ -116,8 +158,9 @@ test('restart blocks when agents are running and the guard is on', async () => {
 test('countRunningAgents reports unknown rather than zero when the list cannot be read', () => {
   // This backs a protection the user explicitly opted into: when the agent list
   // cannot be read the result must be "unknown", never 0 — 0 would silently lift
-  // the protection, which is the unsafe direction.
-  assert.equal(countRunningAgents(undefined), 0)
+  // the protection, which is the unsafe direction. An absent service (a DSH
+  // build without `agents`) is unknown for the same reason.
+  assert.equal(countRunningAgents(undefined), null)
   assert.equal(countRunningAgents({ list: () => [] }), 0)
   assert.equal(countRunningAgents({ list: () => [{ status: 'running' }] }), 1)
   assert.equal(countRunningAgents({ list: () => { throw new Error('boom') } }), null)
@@ -127,25 +170,43 @@ test('countRunningAgents reports unknown rather than zero when the list cannot b
 test('restart refuses when the agent list cannot be read and the gate is on', async () => {
   // This one guards the branch this fix wave is about: without it, reverting the
   // gate to `running > 0` would still leave the whole suite green.
-  const handlers = createHandlers({
-    platform: 'win32',
-    dshHome: 'C:\\dsh',
-    config: { blockWhenAgentsRunning: true },
-    execPath: 'node.exe',
-    argv: ['bin.js', 'web'],
-    cwd: 'C:\\work',
-    agents: {
-      list: () => {
-        throw new Error('boom')
+  const handlers = createHandlers(
+    restartDeps({
+      config: { blockWhenAgentsRunning: true },
+      agents: {
+        list: () => {
+          throw new Error('boom')
+        },
       },
-    },
-    spawnHelper: () => {
-      throw new Error('must not spawn')
-    },
-    scheduleExit: () => {
-      throw new Error('must not schedule an exit')
-    },
-  })
+      spawnHelper: () => {
+        throw new Error('must not spawn')
+      },
+      scheduleExit: () => {
+        throw new Error('must not schedule an exit')
+      },
+    }),
+  )
+  const res = fakeRes()
+  await handlers.restart(req(), res)
+  assert.equal(res.statusCode, 409)
+  assert.match(res.body, /unreadable/)
+})
+
+test('restart refuses when the agents service is absent and the gate is on', async () => {
+  // The service was made an optional injection, so its absence must still refuse
+  // rather than silently lift the gate.
+  const handlers = createHandlers(
+    restartDeps({
+      config: { blockWhenAgentsRunning: true },
+      agents: undefined,
+      spawnHelper: () => {
+        throw new Error('must not spawn')
+      },
+      scheduleExit: () => {
+        throw new Error('must not schedule an exit')
+      },
+    }),
+  )
   const res = fakeRes()
   await handlers.restart(req(), res)
   assert.equal(res.statusCode, 409)

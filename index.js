@@ -4,13 +4,11 @@
 // talks to these with same-origin fetch; no Typert dependency is needed.
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isSupportedPlatform, unsupportedReason } from './lib/platform.js'
 import { isPortListening } from './lib/port.js'
 import {
-  PLUGIN_DEFAULTS,
   resolvePluginConfig,
   resolveDshHome,
   configDir,
@@ -19,11 +17,11 @@ import {
   buildConfigFile,
 } from './lib/config.js'
 import {
-  RUN_VALUE_NAME,
   readRunValue,
   writeRunValue,
   removeRunValue,
   isOurEntry,
+  registryCommand,
 } from './lib/registry.js'
 import { detectCommand } from './lib/detect-command.js'
 import { parseLatestAccessUrl } from './lib/parse-url.js'
@@ -34,13 +32,15 @@ const SERVICE_JS = fileURLToPath(new URL('./service.js', import.meta.url))
 /**
  * Count agents that are mid-turn; used only to inform or gate a restart.
  *
- * @returns the count, or `null` meaning "unknown" when the list cannot be read.
- *   Never 0 on failure: `blockWhenAgentsRunning` is a protection the user
- *   explicitly opted into, and reporting 0 would silently lift it — the unsafe
- *   direction. The caller refuses the restart when the count is null.
+ * @returns the count, or `null` meaning "unknown" when the service is absent or
+ *   its list cannot be read. Never 0 on failure: `blockWhenAgentsRunning` is a
+ *   protection the user explicitly opted into, and reporting 0 would silently
+ *   lift it — the unsafe direction. The caller refuses the restart when the
+ *   count is null. An absent service (a DSH build without `agents`) is
+ *   "unknown" too: the plugin must still load and mount its routes there.
  */
 export function countRunningAgents(agentsService) {
-  if (agentsService === undefined || agentsService === null) return 0
+  if (agentsService === undefined || agentsService === null) return null
   let list
   try {
     list = agentsService.list?.()
@@ -97,12 +97,17 @@ export const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::
  * Host itself to be a loopback authority, and the port to be the one this
  * plugin actually serves, before comparing the two.
  *
- * @param expectedPort - the plugin's configured dshPort; when given, the Host
- *   must name exactly it.
+ * @param expectedPort - the plugin's configured dshPort; when given, a loopback
+ *   Host must name exactly it.
  * @param allowedHosts - extra authorities the user explicitly trusts, for
  *   reaching DSH through a reverse proxy (frp + auth-proxy forwards the
  *   original Host, so the browser sends the public domain, not loopback).
- *   The port and same-origin checks still apply to these.
+ *   For these the port-equality check is skipped: a browser reaching
+ *   `https://derp.example.com` sends `Host: derp.example.com` with no port at
+ *   all, so demanding the local `dshPort` would 403 the very case this option
+ *   exists for. The allow-list entry is already an explicit per-authority
+ *   opt-in, and the same-origin check still binds it. Loopback keeps the strict
+ *   port check.
  */
 export function sameOrigin(headers, expectedPort, allowedHosts = []) {
   const host = headers?.host
@@ -116,18 +121,22 @@ export function sameOrigin(headers, expectedPort, allowedHosts = []) {
   } catch {
     return false
   }
+  const loopback = LOOPBACK_HOSTNAMES.has(hostUrl.hostname)
   const trusted = Array.isArray(allowedHosts)
     ? allowedHosts.some((entry) => {
         // The plan documents entries as bare hostnames (['derp.example.com'])
         // while the listing compares them as full authorities; accept both so a
-        // user following either form is admitted. The port and same-origin
-        // checks below still bind whichever form matched.
+        // user following either form is admitted. The same-origin check below
+        // still binds whichever form matched.
         const configured = String(entry).toLowerCase()
         return configured === hostUrl.host.toLowerCase() || configured === hostUrl.hostname.toLowerCase()
       })
     : false
-  if (!LOOPBACK_HOSTNAMES.has(hostUrl.hostname) && !trusted) return false
-  if (Number.isInteger(expectedPort) && hostUrl.port !== String(expectedPort)) return false
+  if (!loopback && !trusted) return false
+  if (loopback && Number.isInteger(expectedPort) && hostUrl.port !== String(expectedPort)) return false
+  // Portless only ever comes from a non-loopback authority (the loopback check
+  // above already rejected a portless loopback Host), so there is nothing to
+  // exempt here.
   return originUrl.host === hostUrl.host
 }
 
@@ -230,10 +239,21 @@ export function createHandlers(deps) {
           'utf16le',
         )
         registry.writeRunValue(vbsPath)
-        send(res, 200, { enabled: true, configPath: configFilePath(dshHome), vbsPath })
+        // §5.1 step 7 returns the stored registry value too, so the user can
+        // confirm what will run at login.
+        send(res, 200, {
+          enabled: true,
+          registryValue: registryCommand(vbsPath),
+          configPath: configFilePath(dshHome),
+          vbsPath,
+        })
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        send(res, 500, { error: `enable failed: ${message}` })
+        // §7 row 2: the likely cause is security software blocking the write,
+        // which is not something the message alone can reveal.
+        send(res, 500, {
+          error: `enable failed: ${message} (security software may be blocking the registry write)`,
+        })
       }
     },
 
@@ -258,6 +278,15 @@ export function createHandlers(deps) {
       if (!guard(req, res)) return
       if (restarting) {
         send(res, 409, { error: 'a restart is already scheduled' })
+        return
+      }
+      // The detach helper exists only once autostart has been enabled: `enable`
+      // is what writes config.json, and service.js restart exits 1 without it.
+      // Spawning anyway would exit this host and leave nothing behind, i.e.
+      // "restart" would silently mean "shut down". §7 has a row for this
+      // ("请先启用自启"); the card also disables the button, this is the backstop.
+      if (!fsImpl.existsSync(configFilePath(dshHome))) {
+        send(res, 400, { error: 'enable autostart first: config.json is missing' })
         return
       }
       const running = countRunningAgents(deps.agents)
@@ -311,11 +340,13 @@ export function cleanupAutostart(deps) {
 }
 
 /** Cordis row entry: mount the four routes on the web server. */
-// `agents` must be injected and handed to createHandlers — without it the row
-// never supplies deps.agents, countRunningAgents always sees undefined and
-// returns 0, and blockWhenAgentsRunning becomes a protection that silently
-// does nothing.
-export const inject = ['webServer', 'agents']
+// Only `webServer` is required. `agents` is read optionally in apply(): making
+// it a hard injection would make the whole plugin contingent on a service some
+// DSH builds do not have — cordis would never resolve it, this row would never
+// apply, no route would mount, and the card could only report "cannot read
+// state". countRunningAgents treats the absent service as "unknown", so the
+// blockWhenAgentsRunning gate still refuses rather than silently passing.
+export const inject = ['webServer']
 
 export function apply(ctx, config) {
   const handlers = createHandlers({ config, agents: ctx.get('agents') })

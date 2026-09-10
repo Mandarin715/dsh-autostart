@@ -61,8 +61,19 @@ In the profile's `cordis.patch.yml`:
 > **`allowedHosts` is opt-in — you must add the entry yourself.** The default is an empty array, meaning **no non-loopback Host is trusted**.
 > If you reach DSH through a reverse proxy (for example frp + auth-proxy, which forwards the browser's **original Host**),
 > the request's Host is your public domain rather than `127.0.0.1`, so the write buttons (enable / disable autostart,
-> restart service) are refused with **403**. Add your domain to `allowedHosts` to make those buttons work; the port check
-> and the same-origin check (Origin must equal Host exactly) still apply to those entries.
+> restart service) are refused with **403**. Add your domain to `allowedHosts` to make those buttons work; the
+> same-origin check (Origin must equal Host exactly) still applies to those entries — see the accepted forms below.
+
+**Accepted `allowedHosts` forms:** a bare host, or `host:port` — for example `['derp.example.com']` or
+`['derp.example.com:8443']`. Do **not** include a scheme or a path (`https://derp.example.com/` is wrong).
+Because a browser reaching `https://derp.example.com` sends no port at all, the local `dshPort` check is **skipped for
+allow-listed authorities** — the entry itself is the explicit opt-in, and the Origin/Host match still has to hold.
+Loopback keeps the strict port check.
+
+> **Changing this plugin's config disposes the plugin.** Adding `allowedHosts` (or editing any other field) causes DSH to
+> reload the plugin: the old instance is disposed, and **dispose removes the `DSH autostart` registry entry** it owns.
+> That is intentional — the entry must never outlive the plugin — but it means you have to **open the settings card and
+> enable autostart again** after any config change. Re-enabling is idempotent.
 
 ## Generated files
 

@@ -61,8 +61,18 @@ dsh plugin --profile web add github:Mandarin715/dsh-autostart
 > **`allowedHosts` 必须由你显式填写(opt-in)。** 默认是空数组,即**不信任任何非回环的 Host**。
 > 如果你是通过反向代理访问 DSH(例如 frp + auth-proxy,它会把浏览器发来的**原始 Host** 转发过来),
 > 那么请求里的 Host 是公网域名而不是 `127.0.0.1`,写操作按钮(启用/停用自启、重启服务)会被守卫
-> 拒绝并返回 **403**。把你的域名填进 `allowedHosts` 后这些按钮才可用;端口校验与同源校验
-> (Origin 必须与 Host 完全一致)对这些条目**仍然生效**。
+> 拒绝并返回 **403**。把你的域名填进 `allowedHosts` 后这些按钮才可用;同源校验
+> (Origin 必须与 Host 完全一致)对这些条目**仍然生效**——可接受的写法见下。
+
+**`allowedHosts` 可接受的写法**:裸主机名,或 `host:port`,例如 `['derp.example.com']` 或
+`['derp.example.com:8443']`。**不要**带协议头或路径(`https://derp.example.com/` 是错的)。
+浏览器访问 `https://derp.example.com` 时 `Host` **不带端口**,因此对白名单里的权威**跳过**本地 `dshPort`
+校验——填进白名单本身就是显式授权,而 Origin 与 Host 的同源校验依然必须成立。回环地址仍保持严格端口校验。
+
+> **改动本插件的配置会导致插件被重新加载(dispose)。** 添加 `allowedHosts`(或改任何其他字段)会让 DSH
+> 重新加载插件:旧实例被 dispose,而 **dispose 会删掉它自己写的那条 `DSH autostart` 注册表项**。
+> 这是有意为之——那条自启项绝不能比插件活得更久——但代价是:**改完配置后必须回到设置页重新启用一次自启**。
+> 重复启用是幂等的。
 
 ## 生成物位置
 

@@ -21,6 +21,8 @@ window.__ModuleLoader__.load({
       '.dsas_warn{color:var(--dsw-alias-state-warning-primary)}',
       '.dsas_error{color:var(--dsw-alias-state-error-primary)}',
       '.dsas_ok{color:var(--dsw-alias-state-success-primary)}',
+      '.dsas_disclaimer{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}',
+      '.dsas_disclaimer a{color:inherit}',
     ].join('')
 
     const CSS_TAG = 'dsh-autostart/card.css'
@@ -55,6 +57,9 @@ window.__ModuleLoader__.load({
       'card.confirm': '重启会中断正在进行的任务,未落盘的对话可能丢失。确定继续吗?',
       'card.unsupported': '仅支持 Windows',
       'card.loadFailed': '无法读取插件状态',
+      'card.loading': '正在读取状态…',
+      'card.restartNeedsAutostart': '请先启用开机自启:需要先由它生成 config.json,重启助手才能工作',
+      'card.disclaimer': '⚠️ 重启会中断正在进行的任务,未落盘的对话可能丢失。详见免责声明。',
     }
     const en = {
       'card.title': 'DSH service & boot autostart',
@@ -79,6 +84,9 @@ window.__ModuleLoader__.load({
       'card.confirm': 'Restarting interrupts running tasks; unsaved conversation may be lost. Continue?',
       'card.unsupported': 'Windows only',
       'card.loadFailed': 'Could not read plugin state',
+      'card.loading': 'Reading state…',
+      'card.restartNeedsAutostart': 'Enable autostart first: its config.json is what the restart helper reads',
+      'card.disclaimer': '⚠️ Restarting interrupts running tasks; unsaved conversation may be lost. See the disclaimer.',
     }
 
     const NS = 'dsh-autostart'
@@ -121,8 +129,10 @@ window.__ModuleLoader__.load({
               setError(t('card.loadFailed'))
               return
             }
+            // Deliberately no setError(null) on success: post() writes the
+            // host's error message and then reloads the state, so clearing here
+            // would erase a 400/403/409/500 before the user could read it.
             setState(payload)
-            setError(null)
           })
           .catch(() => setError(t('card.loadFailed')))
       }, [t])
@@ -134,12 +144,14 @@ window.__ModuleLoader__.load({
       const post = react.useCallback(
         (url) => {
           setBusy(true)
+          // Clear at the start: the outcome, not the reload, decides what the
+          // error area shows (see load()).
+          setError(null)
           return fetch(url, { method: 'POST' })
             .then((res) => readJson(res).then((body) => ({ status: res.status, body })))
             .then(({ status, body }) => {
               setBusy(false)
               if (status >= 400) setError(body?.error ?? `HTTP ${status}`)
-              else setError(null)
               load()
               return status < 400
             })
@@ -160,6 +172,10 @@ window.__ModuleLoader__.load({
       }
 
       const url = state?.accessUrl ?? null
+      // Nothing to restart before autostart is on: the host refuses with 400
+      // because service.js cannot read config.json. Disabling it here (with the
+      // reason shown) makes the 400 a backstop rather than the primary UX.
+      const restartDisabledReason = state === null ? t('card.loading') : state.autostartEnabled ? null : t('card.restartNeedsAutostart')
       const hookText =
         state === undefined || state === null
           ? ''
@@ -248,7 +264,8 @@ window.__ModuleLoader__.load({
               key: 'restart',
               type: 'button',
               className: 'dsas_btn',
-              disabled: busy,
+              disabled: busy || restartDisabledReason !== null,
+              title: restartDisabledReason ?? undefined,
               onClick: () => {
                 if (typeof window !== 'undefined' && window.confirm(t('card.confirm')) === false) return
                 post('/dsh-autostart/restart')
@@ -257,7 +274,24 @@ window.__ModuleLoader__.load({
             busy ? t('card.restarting') : t('card.restart'),
           ),
           error === null ? null : h('span', { key: 'err', className: 'dsas_error' }, error),
+          restartDisabledReason === null
+            ? null
+            : h('span', { key: 'restartHint', className: 'dsas_warn' }, restartDisabledReason),
         ]),
+        // §6.1: the card ends with a small line pointing at the §0 disclaimer.
+        h(
+          'div',
+          { className: 'dsas_disclaimer', key: 'disclaimer' },
+          h(
+            'a',
+            {
+              href: 'https://github.com/Mandarin715/dsh-autostart#-disclaimer-read-first',
+              target: '_blank',
+              rel: 'noreferrer',
+            },
+            t('card.disclaimer'),
+          ),
+        ),
       ])
     }
 
