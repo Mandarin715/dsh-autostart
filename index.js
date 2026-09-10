@@ -274,6 +274,11 @@ export async function buildState(deps) {
     hookScript,
     hookExists: hookScript === '' ? false : fs.existsSync(hookScript),
     configPath: configFilePath(dshHome),
+    // What the restart route actually requires. The card used to gate its Restart
+    // button on `autostartEnabled` while the route only needs this file, so with
+    // autostart off but config.json present the button was greyed and the hint
+    // named a file that exists.
+    configExists: fs.existsSync(configFilePath(dshHome)),
     vbsPath,
     logPath: paths.service,
   }

@@ -172,10 +172,15 @@ window.__ModuleLoader__.load({
       }
 
       const url = state?.accessUrl ?? null
-      // Nothing to restart before autostart is on: the host refuses with 400
-      // because service.js cannot read config.json. Disabling it here (with the
-      // reason shown) makes the 400 a backstop rather than the primary UX.
-      const restartDisabledReason = state === null ? t('card.loading') : state.autostartEnabled ? null : t('card.restartNeedsAutostart')
+      // The route's real precondition is config.json (service.js cannot start DSH
+      // without it), NOT the autostart entry: gating on autostartEnabled greyed the
+      // button out while naming a file that already existed.
+      const restartDisabledReason =
+        state === null
+          ? t('card.loading')
+          : state.configExists === false
+            ? t('card.restartNeedsAutostart')
+            : null
       const hookText =
         state === undefined || state === null
           ? ''

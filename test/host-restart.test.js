@@ -2,6 +2,9 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { spawn } from 'node:child_process'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { buildLauncherArgv } from '../lib/launch-helper.js'
 import {
   createHandlers,
@@ -540,4 +543,26 @@ test('restart returns 500 and arms no exit when the helper rejects asynchronousl
   assert.equal(res.statusCode, 500)
   assert.match(res.body, /launcher boom/)
   assert.equal(exits, 0, 'a failed launch must not exit the host')
+})
+
+test('state reports whether config.json exists, so the card can gate accurately', async () => {
+  // Observed on a real install: autostart was off but config.json was present, so
+  // the card greyed out Restart and told the user to enable autostart first "because
+  // that is what generates config.json" — a file that already existed. The gate and
+  // the hint both have to follow the route's actual precondition.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-state-'))
+  try {
+    const handlers = createHandlers(restartDeps({ dshHome: dir }))
+    const before = fakeRes()
+    await handlers.state({}, before)
+    assert.equal(JSON.parse(before.body).configExists, false, 'no config.json yet')
+
+    fs.mkdirSync(path.join(dir, 'dsh-autostart'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'dsh-autostart', 'config.json'), '{}', 'utf8')
+    const after = fakeRes()
+    await handlers.state({}, after)
+    assert.equal(JSON.parse(after.body).configExists, true, 'config.json present now')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
