@@ -117,13 +117,21 @@ export async function runStart(input) {
   return { started: true, pid, up }
 }
 
-/** Whether a pid is still alive on this OS (Windows-safe). */
-export function defaultIsAlive(pid) {
+/**
+ * Whether a pid is still alive on this OS.
+ *
+ * Only ESRCH means "gone". Any other error — notably EPERM, for a live process
+ * this user may not signal — must report ALIVE: a false "gone" would skip
+ * runRestart's abort and spawn a second instance while the old one may still
+ * hold the port, which is the exact failure mode this path exists to avoid.
+ * The `kill` seam exists so this is testable without touching a real process.
+ */
+export function defaultIsAlive(pid, kill = (target, signal) => process.kill(target, signal)) {
   try {
-    process.kill(pid, 0)
+    kill(pid, 0)
     return true
-  } catch {
-    return false
+  } catch (error) {
+    return error?.code !== 'ESRCH'
   }
 }
 

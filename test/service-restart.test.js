@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { waitForProcessExit, runRestart, main } from '../service.js'
+import { waitForProcessExit, runRestart, defaultIsAlive, main } from '../service.js'
 
 function baseConfig(overrides = {}) {
   return {
@@ -90,4 +90,24 @@ test('main rejects restart without a --pid', async () => {
     configPath: 'test/fixtures/config.json',
   })
   assert.equal(code, 2)
+})
+
+test('defaultIsAlive treats only ESRCH as gone', () => {
+  // All three killers are injected, so this test probes no real process.
+  const alive = () => {}
+  const esrch = () => {
+    const error = new Error('no such process')
+    error.code = 'ESRCH'
+    throw error
+  }
+  const eperm = () => {
+    const error = new Error('operation not permitted')
+    error.code = 'EPERM'
+    throw error
+  }
+  assert.equal(defaultIsAlive(1, alive), true)
+  assert.equal(defaultIsAlive(1, esrch), false)
+  // EPERM means the process exists but may not be signalled: reporting it as
+  // gone would skip the abort and could start a second instance.
+  assert.equal(defaultIsAlive(1, eperm), true)
 })
