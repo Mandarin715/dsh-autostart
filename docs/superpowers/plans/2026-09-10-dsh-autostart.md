@@ -2462,11 +2462,24 @@ test('restart blocks when agents are running and the guard is on', async () => {
     cwd: 'C:\\work',
     agents: { list: () => [{ status: 'running' }] },
     spawnHelper: () => {},
+    // 今天 409 会先返回,但门一旦退化,默认的 setTimeout(() => process.exit(0))
+    // 就会武装真的退出并杀掉测试进程 —— 必须注入空实现。
+    scheduleExit: () => {},
   })
   const res = fakeRes()
   await handlers.restart(req(), res)
   assert.equal(res.statusCode, 409)
   assert.match(res.body, /agent/i)
+})
+
+test('countRunningAgents reports unknown rather than zero when the list cannot be read', () => {
+  // 这是一个用户显式开启的保护:读不到 agent 列表时必须按"未知"处理,
+  // 不能当作 0 —— 那会静默解除保护,属于失败方向不安全。
+  assert.equal(countRunningAgents(undefined), 0)
+  assert.equal(countRunningAgents({ list: () => [] }), 0)
+  assert.equal(countRunningAgents({ list: () => [{ status: 'running' }] }), 1)
+  assert.equal(countRunningAgents({ list: () => { throw new Error('boom') } }), null)
+  assert.equal(countRunningAgents({ list: () => 'not-an-array' }), null)
 })
 ```
 
@@ -2482,16 +2495,23 @@ Expected: FAIL —— `countRunningAgents` 未导出 / `restart` 返回 501
 ```js
 import { spawn } from 'node:child_process'
 
-/** Count agents that are mid-turn; used only to inform or gate a restart. */
+/**
+ * Count agents that are mid-turn; used only to inform or gate a restart.
+ *
+ * @returns the count, or `null` meaning "unknown" when the list cannot be read.
+ *   Never 0 on failure: `blockWhenAgentsRunning` is a protection the user
+ *   explicitly opted into, and reporting 0 would silently lift it — the unsafe
+ *   direction. The caller refuses the restart when the count is null.
+ */
 export function countRunningAgents(agentsService) {
   if (agentsService === undefined || agentsService === null) return 0
   let list
   try {
     list = agentsService.list?.()
   } catch {
-    return 0
+    return null
   }
-  if (!Array.isArray(list)) return 0
+  if (!Array.isArray(list)) return null
   return list.filter((agent) => agent?.status === 'running').length
 }
 
@@ -2520,8 +2540,11 @@ export function defaultSpawnHelper(input) {
         return
       }
       const running = countRunningAgents(deps.agents)
-      if (pluginConfig.blockWhenAgentsRunning && running > 0) {
-        send(res, 409, { error: `refusing to restart: ${running} agent(s) are running` })
+      if (pluginConfig.blockWhenAgentsRunning && (running === null || running > 0)) {
+        // null = the list could not be read. Refuse rather than assume zero:
+        // this gate is the user's explicit protection.
+        const detail = running === null ? 'the agent list is unreadable' : `${running} agent(s) are running`
+        send(res, 409, { error: `refusing to restart: ${detail}` })
         return
       }
       try {
@@ -2552,7 +2575,7 @@ export function defaultSpawnHelper(input) {
 - [ ] **Step 4: 跑测试,确认通过**
 
 Run: `node --test test/host-restart.test.js`
-Expected: PASS(5 tests)
+Expected: PASS(6 tests)(5 个原始用例 + 1 个 countRunningAgents 未知态用例)
 
 - [ ] **Step 5: 跑全部测试 + 语法检查**
 
