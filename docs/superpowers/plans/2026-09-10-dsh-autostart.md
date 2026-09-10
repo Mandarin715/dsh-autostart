@@ -1158,7 +1158,7 @@ git commit -m "feat: add HKCU Run registry access with an injectable executor"
 ## Task 8: `service.js` — `start` 模式
 
 **Files:**
-- Create: `service.js`, `test/service-start.test.js`
+- Create: `service.js`, `test/service-start.test.js`, `test/fixtures/config.json`
 
 **Interfaces:**
 - Consumes: `lib/config.js`(`parseConfigFile`)、`lib/port.js`(`isPortListening`, `waitForPort`)
@@ -1281,9 +1281,27 @@ test('runHook maps .ps1/.cmd/.bat to their interpreters', async () => {
 })
 
 test('main rejects an unknown mode', async () => {
-  const code = await main(['node', 'service.js', 'bogus'], {})
+  // 必须传 configPath:不传的话 main 会去读真实用户 home 的 config.json,
+  // 既拿不到测试期望的返回码,还会在用户真实 ~/.dsh 下写一个 service.log。
+  const code = await main(['node', 'service.js', 'bogus'], {
+    configPath: 'test/fixtures/config.json',
+  })
   assert.equal(code, 2)
 })
+```
+
+`test/fixtures/config.json`(本任务创建;Task 9 复用它,不重复创建):
+
+```json
+{
+  "schemaVersion": 1,
+  "command": { "execPath": "node.exe", "argv": ["bin.js", "web", "--no-open"], "cwd": "." },
+  "dshPort": 3080,
+  "hookScript": "",
+  "startTimeoutMs": 1000,
+  "waitForExitMs": 1000,
+  "logPaths": { "out": "out.log", "err": "err.log", "service": "test/fixtures/service.log" }
+}
 ```
 
 - [ ] **Step 2: 跑测试,确认失败**
@@ -1458,7 +1476,7 @@ Expected: PASS(7 tests)
 - [ ] **Step 5: 提交**
 
 ```bash
-git add service.js test/service-start.test.js
+git add service.js test/service-start.test.js test/fixtures/config.json
 git commit -m "feat: add service.js start mode with hook support"
 ```
 
@@ -1577,19 +1595,7 @@ test('main rejects restart without a --pid', async () => {
 })
 ```
 
-`test/fixtures/config.json`(供上面最后一个用例读取):
-
-```json
-{
-  "schemaVersion": 1,
-  "command": { "execPath": "node.exe", "argv": ["bin.js", "web", "--no-open"], "cwd": "." },
-  "dshPort": 3080,
-  "hookScript": "",
-  "startTimeoutMs": 1000,
-  "waitForExitMs": 1000,
-  "logPaths": { "out": "out.log", "err": "err.log", "service": "test/fixtures/service.log" }
-}
-```
+`test/fixtures/config.json` 已由 Task 8 创建,本任务直接复用(不要重复创建;若它不存在,说明 Task 8 未完成)。
 
 - [ ] **Step 2: 跑测试,确认失败**
 
@@ -1680,7 +1686,7 @@ Expected: 全部 PASS
 - [ ] **Step 6: 提交**
 
 ```bash
-git add service.js test/service-restart.test.js test/fixtures/config.json
+git add service.js test/service-restart.test.js
 git commit -m "feat: add service.js restart mode with pid wait"
 ```
 
