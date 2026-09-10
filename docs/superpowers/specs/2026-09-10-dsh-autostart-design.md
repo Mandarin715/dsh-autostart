@@ -1,0 +1,427 @@
+# dsh-autostart — 设计规格(spec)
+
+- 日期:2026-09-10
+- 状态:待评审
+- 目标版本:`dsh-autostart@0.1.0`
+- 验证环境:Windows 10/11 · Node v24.15.0 · DeepSeek Harness `0.1.2-rc.1`
+
+---
+
+## 1. 目标与成功标准
+
+### 1.1 一句话
+
+一个**面向第三方分发**的 DSH 插件:让 Windows 用户**开机自动跑起 DSH 服务**,并能在**设置页一键重启**它——不需要碰终端、不需要记命令、不需要额外依赖。
+
+### 1.2 成功标准
+
+| # | 标准 | 可验证方式 |
+|---|---|---|
+| S1 | 用户装上插件后,能在设置页**一键启用开机自启** | 注册表出现 `DSH autostart` 条目 |
+| S2 | 重启电脑登录后,**DSH 自动在后台起来**,且**不弹任何控制台窗口** | 手动跑 `bootstrap.vbs`,用窗口枚举确认无 console 窗口 |
+| S3 | 用户在设置页点「重启服务」,DSH **数秒内**恢复可用 | 记录 `重启触发 → 端口恢复` 时间差,应 < 15s |
+| S4 | 设置页显示**当前带 token 的访问地址**,可一键复制 | UI 显示与 `dsh-web-server.log` 中最新 URL 一致 |
+| S5 | 启用/停用自启**可逆**,卸载插件**自动清理自己写的注册表项** | 停用后条目消失;卸载后条目消失 |
+| S6 | 非 Windows 平台**明确拒绝**且不产生副作用 | 单测覆盖平台门控分支 |
+
+### 1.3 非目标(YAGNI)
+
+明确**不做**:
+
+- ❌ **不做手机远程 / frp 隧道 / 反向代理** —— 与本插件解耦;需要的人另装 `dsh-mobile-access-plugin`
+- ❌ **不做跨平台**(macOS `launchd` / Linux `systemd`)—— 本版本只支持 Windows
+- ❌ **不内置 frpc / 不管理任何隧道进程**
+- ❌ **不打包 DSH 本体**,不管理 DSH 的安装与升级
+- ❌ **不做服务化(Windows Service)**,只用用户级 `HKCU Run`
+- ❌ **不做守护/自愈**(不实现"发现 DSH 挂了就自动拉起")——只做"开机拉起"与"主动重启"
+
+---
+
+## 2. 背景:为什么要这个插件
+
+本设计基于在一台 Windows 机器上**长期实战验证**得到的结论。以下每条都是踩过的坑,直接决定了设计选择:
+
+| 经验 | 后果 | 本设计如何应对 |
+|---|---|---|
+| `PowerShell -WindowStyle Hidden` 对**常驻脚本**不可靠,会留下可见空控制台窗口 | 用户桌面出现无法关闭的空弹窗 | 用 **`wscript.exe` + VBS** 包装(仅此一处用 VBS) |
+| 固定 `Start-Sleep` 串起来的重启流程耗时 ~81s | "网页打不开"持续 1 分多钟 | **条件轮询**,无固定等待 |
+| DSH `0.1.2-rc.1` 每次启动生成**新的 launch token**,根路径强制校验 | 重启后网页 401,须去日志翻 token URL | 启动时**捕获 stdout 到日志**,UI 解析并展示 URL |
+| 用 `cmd /b` / 会话绑定的方式拉起脚本,进程随会话死亡 | 重启后服务没起来 | 一律 **detached + 独立进程** |
+| 幂等判断用 `:port`(会匹配 TIME_WAIT)导致误判"已在运行" | 服务其实没起来却跳过 | 幂等判断只看 **LISTENING** 状态 |
+| 第三方插件 `dsh-setting-restart` + 标记文件 + 常驻 watcher 共 4 个部件串联 | 部件多、状态易乱、标记易残留 | 本插件**自带按钮 + 自带 Node 助手**,部件降到 **2** |
+| PowerShell 脚本里的中文导致编码乱码、"字符串缺少终止符" | 脚本损坏 | 插件逻辑**全用 Node**,不写中文进 .ps1 |
+
+### 2.1 与既有插件的关系
+
+| | `dsh-mobile-access-plugin`(已有) | **`dsh-autostart`(本设计)** |
+|---|---|---|
+| 职责 | 生成 frp 隧道 + Basic Auth 反代 + 其自启 | **DSH 服务本体的自启 + 重启** |
+| 依赖 | 需要 VPS + 域名 + 证书 | **零外部依赖**(不需要 VPS/域名) |
+| 关系 | 两者**独立**;可选搭配(见 §9 钩子) | |
+
+---
+
+## 3. 架构
+
+### 3.1 部件(共 2 个)
+
+```
+┌──────────────────────────────────────────────┐
+│  ① 插件本体(安装在 DSH profile 里)          │
+│     index.js   host 侧:状态查询 / 自启管理 /  │
+│                重启调度 / HTTP 路由           │
+│     client.js  浏览器侧:设置页 UI 行          │
+│     service.js Node 助手:start / restart 两模式│
+├──────────────────────────────────────────────┤
+│  ② 生成物(用户机器上,启用时才生成)        │
+│     config.json    记录真实启动命令与策略     │
+│     bootstrap.vbs  开机无窗口入口             │
+│     日志文件        dsh-web-server.log 等     │
+└──────────────────────────────────────────────┘
+```
+
+**对比**:原方案有 4 个部件(第三方插件 + 标记文件 + 常驻 watcher + 脚本)。本设计**去掉 watcher 与标记文件**,因为它们存在的唯一理由是"第三方插件无法执行自定义逻辑";而本插件**自己就是那个逻辑**,于是宿主进程可以直接 spawn 助手,无需中转信号。
+
+### 3.2 为什么 `service.js` 必须是独立进程
+
+重启的本质是"**杀掉自己再把自己拉起来**"。宿主 DSH 进程调用 `process.exit(0)` 后,没有任何代码还能继续运行,因此:
+
+- 启动 DSH 的动作**必须**由一个**不属于该进程树**的助手完成
+- 助手由宿主 `spawn(..., { detached: true })` + `unref()` 启动,并**重定向 stdio 到日志**,确保宿主死亡后它仍在
+
+### 3.3 组件职责与边界
+
+| 单元 | 职责 | 依赖 | 可否独立理解 |
+|---|---|---|---|
+| `client.js` | 只做 UI 与 HTTP 调用,不含业务判断 | DSH client runtime | ✅ 看 UI 即知全貌 |
+| `index.js` | 平台门控、状态聚合、注册表读写、生成文件、spawn 助手 | `ctx.webServer`、`node:fs` | ✅ |
+| `service.js` | 与插件解耦的纯 Node 脚本:读 config → 启动/重启 DSH → 跑钩子 → 写日志 | 仅 `node:*` | ✅ **可脱离 DSH 单独运行**(便于测试) |
+| `config.json` | 两个组件之间的**唯一契约** | — | ✅ |
+
+> `service.js` 不 `import` 插件代码,只读 `config.json`。这让它可以用 `node service.js start` 直接手动测试,无需启动 DSH。
+
+---
+
+## 4. 文件布局
+
+### 4.1 仓库结构
+
+```
+dsh-autostart/
+├── package.json            # dsh.bundle.patch + dsh.client(platform: web)
+├── cordis.patch.yml        # insert: id=dsh-autostart, name=dsh-autostart
+├── index.js                # host 侧(§5.1)
+├── client.js               # 浏览器侧(§6)
+├── service.js              # Node 助手(§5.3)
+├── lib/                    # 纯函数模块(便于单测)
+│   ├── platform.js         # 平台门控
+│   ├── detect-command.js   # 探测当前 DSH 启动命令 + argv 规范化
+│   ├── registry.js         # HKCU Run 读写
+│   ├── render-vbs.js       # bootstrap.vbs 渲染
+│   ├── parse-url.js        # 从日志解析最新 token URL
+│   ├── port.js             # 端口状态探测(统一实现,见 §6.1)
+│   └── config.js           # 配置默认值 + 校验
+├── test/                   # node:test 单测
+├── README.md               # 英文
+├── README.zh.md            # 中文
+└── LICENSE                 # MIT
+```
+
+### 4.2 用户机器上的生成物
+
+```
+~/.dsh/dsh-autostart/
+├── config.json             # 由插件生成,service.js 读取
+├── bootstrap.vbs           # 由插件生成,开机入口
+├── dsh-web-server.log      # DSH stdout(含 token URL)
+├── dsh-web-server.err.log  # DSH stderr
+└── service.log             # service.js 自己的日志
+```
+
+### 4.3 `config.json` 结构(组件间唯一契约)
+
+```json
+{
+  "schemaVersion": 1,
+  "createdAt": "2026-09-10T09:29:00.000Z",
+  "command": {
+    "execPath": "C:\\Program Files\\nodejs\\node.exe",
+    "argv": ["C:\\...\\@deepseek-ai\\dsh\\lib\\bin.js", "web", "--no-open"],
+    "cwd": "C:\\Users\\<user>"
+  },
+  "dshPort": 3080,
+  "hookScript": "",
+  "openBrowserOnBoot": false,
+  "waitForExitMs": 30000,
+  "startTimeoutMs": 30000,
+  "logPaths": {
+    "out": "C:\\Users\\<user>\\.dsh\\dsh-autostart\\dsh-web-server.log",
+    "err": "C:\\Users\\<user>\\.dsh\\dsh-autostart\\dsh-web-server.err.log",
+    "service": "C:\\Users\\<user>\\.dsh\\dsh-autostart\\service.log"
+  }
+}
+```
+
+**契约稳定性**:`service.js` 只依赖上表字段。新增字段必须提供默认值,保证旧 `config.json` 仍可用。
+
+---
+
+## 5. 数据流
+
+### 5.1 流 ①:启用开机自启
+
+```
+用户在设置页点「启用开机自启」
+  → client: POST /dsh-autostart/autostart/enable
+  → host(index.js):
+      1. 平台门控:非 Windows → 400 + 明确错误
+      2. 探测当前 DSH 命令(lib/detect-command.js):
+           execPath = process.execPath
+           argv     = process.argv.slice(1)
+           cwd      = process.cwd()
+      3. 规范化 argv:确保含 "--no-open"(除非 openBrowserOnBoot=true)
+      4. 写 ~/.dsh/dsh-autostart/config.json
+      5. 渲染并写 bootstrap.vbs(lib/render-vbs.js)
+      6. 写注册表 HKCU\...\Run:
+           name  = "DSH autostart"
+           value = wscript.exe "<abs path>\bootstrap.vbs"
+      7. 返回 { enabled: true, registryValue, configPath, vbsPath }
+  → client: 刷新状态
+```
+
+**幂等**:重复启用为覆盖写,不产生重复注册表项。
+**失败出口**:任一步失败 → 返回明确错误(见 §7)。
+
+### 5.2 流 ②:一键重启
+
+```
+用户在设置页点「重启」→ 二次确认
+  → client: POST /dsh-autostart/restart
+  → host(index.js):
+      1. same-origin 校验,失败 → 403
+      2. 防重入:已在重启中 → 409
+      3. 读取 `agents` 服务(ctx.get('agents')),统计 status === 'running' 的 Agent 数
+         · blockWhenAgentsRunning 为真且计数 > 0 → 409(附计数)
+         · 否则仅把计数写入日志(默认不阻止)
+      4. spawn detached: node <service.js> restart --pid <本进程 pid>
+      5. 返回 202 { accepted: true }
+      6. 等 exitDelayMs(默认 800ms)→ process.exit(0)
+  → service.js restart:
+      1. 读 config.json
+      2. 轮询等旧 pid 消失(process.kill(pid, 0)),上限 waitForExitMs(30s)
+      3. 用 config.command 启动 DSH:detached,stdout→out 日志,stderr→err 日志
+      4. 轮询等端口 LISTENING,上限 30s(条件轮询,无固定 sleep)
+      5. 若 hookScript 非空且存在 → 执行钩子,记录其退出码
+      6. 全过程写 service.log → 退出
+```
+
+**超时语义**:
+- 若「等旧进程退出」超时 → **放弃重启,不改动现状**(不启动第二个实例),日志记录
+- 若「等端口起来」超时 → 记录失败,但**不杀**刚启动的进程(可能只是起得慢)
+
+### 5.3 流 ③:开机自启
+
+```
+Windows 登录
+  → HKCU Run 触发:wscript.exe "<...>\bootstrap.vbs"
+  → bootstrap.vbs:以 0 号窗口(隐藏)运行 node <service.js> start,不等待
+  → service.js start:
+      1. 读 config.json(缺失/损坏 → 写 service.log 并退出,不弹框)
+      2. 幂等:端口已 LISTENING → 记日志"已在运行",退出
+      3. 启动 DSH(detached,stdio → 日志)
+      4. 轮询等端口 LISTENING(上限 30s)
+      5. 跑钩子脚本(若配置)
+      6. 写 service.log → 退出(DSH 继续独立运行)
+```
+
+**关键**:钩子在**开机与重启都会跑**,因此用户可以把"确保其他依赖进程在跑"的逻辑全部放进钩子,从而**把多条自启项合并成一条**(见 §9)。
+
+### 5.4 `bootstrap.vbs` 内容(渲染模板)
+
+```vbs
+' Generated by dsh-autostart. Do not edit by hand.
+Set sh = CreateObject("WScript.Shell")
+sh.Run """<execPath>"" ""<serviceJs>"" start", 0, False
+```
+
+`0` = 窗口隐藏,`False` = 不等待。这是"无控制台窗口"的唯一保证手段。
+
+---
+
+## 6. UI 与接口
+
+### 6.1 设置页 UI(设置 → 通用设置,一张卡片)
+
+| 元素 | 内容 | 数据来源 |
+|---|---|---|
+| 服务状态 | `运行中(端口 3080)` / `已停止` | 端口探测 |
+| 自启状态 | `已启用` / `未启用` | 读注册表实测 |
+| 当前访问地址 | 最新带 token URL + 复制按钮 | 解析 `dsh-web-server.log` 最后一条匹配 |
+| 自启开关 | 启用 / 停用 | 流 ① / 停用接口 |
+| 重启按钮 | 带二次确认 | 流 ② |
+| 钩子状态 | 路径 + 存在性(不存在显黄字) | `fs.existsSync` |
+| 非 Windows | 整行退化为提示文案 | 平台门控 |
+
+**UI 原则**:所有状态来自**实测**(端口、注册表、文件),不使用缓存值,避免 UI 与真实状态不符。
+
+**端口探测的统一实现**(`lib/port.js`,`index.js` 与 `service.js` 共用):
+
+- 判定"运行中" = 尝试 TCP 连接 `127.0.0.1:<dshPort>`,成功即在运行(net.connect + 短超时)
+- **不用** `netstat` 文本解析、**不用** `:port` 子串匹配(会误匹配 `TIME_WAIT` 与客户端连接——这是既有系统的教训)
+- 探测失败(ECONNREFUSED / 超时)= 未运行
+
+### 6.2 HTTP 路由
+
+| 方法 | 路径 | 作用 | 副作用 |
+|---|---|---|---|
+| GET | `/dsh-autostart/state` | 聚合状态 | 无 |
+| POST | `/dsh-autostart/autostart/enable` | 启用自启 | 写文件 + 注册表 |
+| POST | `/dsh-autostart/autostart/disable` | 停用自启 | 删注册表(保留文件) |
+| POST | `/dsh-autostart/restart` | 触发重启 | 杀宿主 + 拉起 |
+
+**安全要求**:
+- 所有 POST **必须**做 same-origin 校验(比对 `Origin` 与 `Host`),不通过返回 403
+- 原因:这些接口监听在 `localhost`,若无校验,任意网页都能通过 CSRF 触发**重启**(破坏性副作用)
+- `state` 为只读,可不强制校验,但仍不返回敏感信息(token URL 除外——它就是本机用户自用)
+
+### 6.3 插件配置块
+
+```yaml
+- id: dsh-autostart
+  name: dsh-autostart
+  config:
+    hookScript: ''                 # 可选,服务起来后执行的脚本绝对路径
+    dshPort: 3080
+    exitDelayMs: 800
+    waitForExitMs: 30000
+    startTimeoutMs: 30000
+    openBrowserOnBoot: false
+    blockWhenAgentsRunning: false
+```
+
+所有字段有默认值;缺省时插件可正常工作。
+
+---
+
+## 7. 错误处理
+
+| 场景 | 行为 | 用户可见位置 |
+|---|---|---|
+| 非 Windows 平台 | 启用/重启接口返回 400 + 原因;`state` 标 `supported:false` | UI 显示"仅支持 Windows" |
+| 注册表写入失败 | 返回 500 + `registry write failed`;提示可能被安全软件拦截 | UI 错误提示 |
+| `config.json` 缺失/损坏(开机) | 写 `service.log` 后退出,**不弹任何对话框** | 仅日志 |
+| `config.json` 缺失(重启时) | 返回 400,提示"请先启用自启"(启用动作本身会生成它) | UI 错误提示 |
+| `node` 路径失效(开机) | 写日志退出 | 仅日志 |
+| 启动时端口已被占用 | 幂等跳过,记"已在运行" | UI 状态显示运行中 |
+| 钩子脚本不存在 | 跳过并记日志;如配置了路径但不存在,UI 显黄字 | UI + 日志 |
+| 钩子执行失败(非零退出) | **不阻断** DSH 启动;记录退出码与 stderr | 仅日志 |
+| 重启中重复点击 | 返回 409 | UI 提示"正在重启中" |
+| 等旧进程退出超时 | 中止重启(不启动第二实例),写日志 | 仅日志 |
+| 等端口起来超时 | 记录失败,不杀进程 | 仅日志 |
+| spawn 助手失败 | 返回 500,宿主**不退出**(避免把服务搞停) | UI 错误提示 |
+
+**总原则**:**DSH 服务本身优先于辅助功能**。任何钩子/日志/UI 层面的失败都不得阻止 DSH 起来;而任何会导致"服务消失"的操作都必须有明确的失败出口。
+
+---
+
+## 8. 测试策略
+
+### 8.1 自动化(Node 内置 `node:test`,零新增依赖)
+
+| 模块 | 用例 |
+|---|---|
+| `lib/platform.js` | 非 Windows 拒绝;Windows 通过 |
+| `lib/detect-command.js` | 给定 argv 数组 → 正确切分 execPath/argv;`--no-open` 规范化(缺则补、`openBrowserOnBoot` 为真则不补) |
+| `lib/parse-url.js` | 从多行日志取**最后一条** `dsh web: http...?token=`;无匹配返回 null;容忍尾随空白/CRLF |
+| `lib/render-vbs.js` | 路径含空格时正确加引号;路径含反斜杠转义正确 |
+| `lib/registry.js` | 注册表 value 字符串构造正确(可注入假执行器测试,不触碰真实注册表) |
+| `lib/port.js` | 对已监听端口返回 true、未监听返回 false(用本进程临时监听一个端口做真实断言) |
+| `lib/config.js` | 默认值填充;非法值拒绝;旧版本 config 缺字段时用默认值 |
+
+### 8.2 语法门
+
+所有 `.js` 文件通过 `node --check`。
+
+### 8.3 手动验收清单(Windows 真机,必须逐条跑)
+
+| # | 步骤 | 期望 |
+|---|---|---|
+| M1 | 启用自启 | 注册表 `DSH autostart` 出现且指向我们生成的 `bootstrap.vbs`;UI 显示"已启用" |
+| M2 | 停用自启 | 注册表条目消失;UI 显示"未启用" |
+| M3 | 点重启,计时 | DSH 在 **< 15s** 内恢复;`service.log` 时间线完整;UI 访问地址更新为新 token |
+| M4 | 手动执行 `bootstrap.vbs` | **无任何控制台窗口出现**;服务已在跑时幂等跳过并记日志 |
+| M5 | 钩子故意填错路径 | DSH 仍正常起来;`service.log` 记录钩子失败 |
+| M6 | 重启时观察桌面 | 全程**无控制台窗口**闪烁/残留 |
+| M7 | 卸载插件 | 注册表条目被清理(仅当仍指向我们的 vbs) |
+
+> M4 与 M6 是本次设计的**回归测试重点**——它们对应 §2 表格里"空控制台窗口"那条教训。
+
+---
+
+## 9. 集成:与用户既有环境共存
+
+本插件**不修改**任何既有配置。它通过**可选钩子**接入其他需求:
+
+```
+config.hookScript = "C:\\Users\\<user>\\.dsh\\scripts\\hooks\\after-service-up.ps1"
+```
+
+该钩子在**开机与重启后**执行,可用于:
+
+- 确保 `auth-proxy`(Basic Auth 反代)在跑 → 手机远程不断
+- 确保 `frpc` 在跑
+- 任何其他依赖服务
+
+**建议的收敛路径**(可选,不在本版本实现):
+
+用户在钩子就绪后,可以把既有的多条 `HKCU Run` 自启项**合并为插件这一条**,由钩子统一负责其余进程。这样整个"手机远程可用"只依赖**一条自启 + 一个钩子脚本**,维护面最小。
+
+**示例钩子内容**(用户自建,非插件提供):
+
+```powershell
+# ~/.dsh/scripts/hooks/after-service-up.ps1
+& "$env:USERPROFILE\.dsh\scripts\start-authproxy.ps1"
+& "$env:USERPROFILE\.dsh\scripts\start-frpc.ps1"
+```
+
+---
+
+## 10. 交付与分发
+
+| 项 | 内容 |
+|---|---|
+| 仓库 | `Mandarin715/dsh-autostart`(public,MIT) |
+| 安装 | `dsh plugin --profile web add github:Mandarin715/dsh-autostart` |
+| npm 发布 | 本版本不做(可选后续) |
+| README | 中英双份:简介 / 要求 / 安装 / 启用 / 配置 / 卸载 / **踩坑说明** |
+| 要求 | Windows 10+;DSH ≥ `0.1.0-rc.6`(**实测于 `0.1.2-rc.1`**);Node ≥ 20(随 DSH 提供) |
+| 版本 | `0.1.0` 起 |
+
+### 10.1 卸载行为
+
+插件 `dispose` 时:
+1. 读取注册表 `DSH autostart`
+2. **仅当**其值指向我们生成的 `bootstrap.vbs` 时删除该条目
+3. **不删除**生成的文件与目录(留给用户手动清理,README 说明路径)
+
+理由:避免误删他人的自启项;文件保留可避免"误卸载后无法排查"。
+
+---
+
+## 11. 假设、风险与缓解
+
+| # | 假设/风险 | 影响 | 缓解 |
+|---|---|---|---|
+| R1 | DSH 未来的版本可能改动"启动参数"或"token 打印格式" | 启停仍可用,但 UI 的访问地址解析可能失效 | 解析失败时 UI 显示"未取到地址"而非报错;格式变化只需更新 `parse-url.js` |
+| R2 | 用户用非 npx 方式(全局安装 / 其他启动器)运行 DSH | 命令探测仍有效(基于 `execPath+argv`) | 探测法本身与安装方式无关 |
+| R3 | 企业安全软件拦截 `HKCU Run` 写入 | 自启不可用 | 明确错误提示;不影响其他功能 |
+| R4 | `wscript.exe` 在某些企业策略下被禁用 | 开机启动会弹窗或失败 | README 记录此限制;M4 用于发现 |
+| R5 | npx 缓存被清理导致 `bin.js` 路径失效 | 开机启动失败 | 记日志;README 提示可改用全局安装 `dsh` |
+| R6 | 用户在 Agent 运行中点重启,任务被中断 | 数据/上下文丢失 | 提供 `blockWhenAgentsRunning` 配置项;默认不阻止(否则无法在对话中点重启) |
+| R7 | 端口被其他程序(非 DSH)占用 | 启动失败,且幂等逻辑会误判为"已在运行" | 启动前用 TCP 连接确认端口"有响应";README 提示改 `dshPort` 或排查占用 |
+
+---
+
+## 12. 未决问题
+
+无。本 spec 的每一节均已在对话中与用户逐段确认。
