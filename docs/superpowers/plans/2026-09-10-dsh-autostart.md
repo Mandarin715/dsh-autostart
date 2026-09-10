@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - **平台**:仅 Windows(`process.platform === 'win32'`);非 Windows 必须显式拒绝,不做跨平台分支
-- **Node**:≥ 20;测试用内置 `node:test`,运行命令 `node --test test/`
+- **Node**:≥ 20;测试用内置 `node:test`,运行命令 `node --test`
 - **零新增运行时依赖**:`package.json` 的 `dependencies` 必须为空;不使用第三方 npm 包
 - **不使用 PowerShell 实现插件逻辑**(仅 `bootstrap.vbs` 负责无窗口启动;用户钩子脚本可由用户自行提供 `.ps1`)
 - **等待一律条件轮询**(`intervalMs` 轮询 + 超时),禁止 `setTimeout(固定时长)` 式的固定 sleep
@@ -152,7 +152,7 @@ Expected: PASS(4 tests)
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test/",
+    "test": "node --test",
     "check": "node --check index.js && node --check client.js && node --check service.js"
   },
   "keywords": [
@@ -1646,7 +1646,7 @@ Expected: PASS(5 tests)
 
 - [ ] **Step 5: 跑全部测试确认无回归**
 
-Run: `node --test test/`
+Run: `node --test`
 Expected: 全部 PASS
 
 - [ ] **Step 6: 提交**
@@ -2238,7 +2238,7 @@ Expected: PASS(5 tests)
 
 - [ ] **Step 5: 跑全部测试 + 语法检查**
 
-Run: `node --test test/ && node --check index.js && node --check service.js`
+Run: `node --test && node --check index.js && node --check service.js`
 Expected: 全部 PASS、语法通过
 
 - [ ] **Step 6: 提交**
@@ -2840,7 +2840,7 @@ Expected: PASS(3 tests)
 
 - [ ] **Step 4: 跑全部测试**
 
-Run: `node --test test/`
+Run: `node --test`
 Expected: 全部 PASS
 
 - [ ] **Step 5: 提交**
