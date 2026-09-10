@@ -2,6 +2,7 @@
 //
 // Registers the settings card's HTTP endpoints. The browser face (client.js)
 // talks to these with same-origin fetch; no Typert dependency is needed.
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -30,9 +31,31 @@ import { renderBootstrapVbs as renderBootstrap } from './lib/render-vbs.js'
 
 const SERVICE_JS = fileURLToPath(new URL('./service.js', import.meta.url))
 
-/** Replaced in Task 11 with the real detached spawn. */
-function defaultSpawnHelper() {
-  throw new Error('restart is not implemented yet')
+/** Count agents that are mid-turn; used only to inform or gate a restart. */
+export function countRunningAgents(agentsService) {
+  if (agentsService === undefined || agentsService === null) return 0
+  let list
+  try {
+    list = agentsService.list?.()
+  } catch {
+    return 0
+  }
+  if (!Array.isArray(list)) return 0
+  return list.filter((agent) => agent?.status === 'running').length
+}
+
+/**
+ * Spawn the detached helper that waits for this process to exit and then
+ * restarts DSH. Detached + unref so it outlives this process.
+ */
+export function defaultSpawnHelper(input) {
+  const child = spawn(input.execPath, [input.serviceJsPath, 'restart', '--pid', String(input.oldPid)], {
+    cwd: input.cwd,
+    detached: true,
+    windowsHide: true,
+    stdio: 'ignore',
+  })
+  child.unref()
 }
 
 /**
@@ -133,6 +156,7 @@ export function createHandlers(deps) {
   const fsImpl = deps.fs ?? fs
   const probe = deps.isPortListening ?? isPortListening
   const spawnHelper = deps.spawnHelper ?? defaultSpawnHelper
+  let restarting = false
 
   const send = (res, code, payload) => {
     res.writeHead(code)
@@ -208,10 +232,33 @@ export function createHandlers(deps) {
       }
     },
 
-    // Task 11 replaces this with the real restart implementation.
     async restart(req, res) {
       if (!guard(req, res)) return
-      send(res, 501, { error: 'not implemented yet' })
+      if (restarting) {
+        send(res, 409, { error: 'a restart is already scheduled' })
+        return
+      }
+      const running = countRunningAgents(deps.agents)
+      if (pluginConfig.blockWhenAgentsRunning && running > 0) {
+        send(res, 409, { error: `refusing to restart: ${running} agent(s) are running` })
+        return
+      }
+      try {
+        spawnHelper({
+          execPath: deps.execPath ?? process.execPath,
+          serviceJsPath: deps.serviceJsPath ?? SERVICE_JS,
+          cwd: deps.cwd ?? process.cwd(),
+          oldPid: deps.currentPid ?? process.pid,
+        })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        send(res, 500, { error: `could not start the restart helper: ${message}` })
+        return
+      }
+      restarting = true
+      send(res, 202, { accepted: true, runningAgents: running })
+      const scheduleExit = deps.scheduleExit ?? ((fn, ms) => setTimeout(fn, ms))
+      scheduleExit(() => process.exit(0), pluginConfig.exitDelayMs)
     },
   }
 }
