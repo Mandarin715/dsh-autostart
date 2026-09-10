@@ -92,14 +92,37 @@ test('buildLauncherArgv asks the WMI service to create the helper process', () =
   assert.ok(script.includes(`'${helperLine}'`), `script did not carry the helper line: ${script}`)
 })
 
+test('buildHelperCommandLine requires an absolute config path', () => {
+  // A relative path would be resolved against whatever cwd the WMI-created
+  // helper happens to get (system32), reopening the wrong-config class this
+  // parameter exists to close. Refusing is the fail-closed answer.
+  assert.throws(
+    () =>
+      buildHelperCommandLine({
+        execPath: 'node.exe',
+        serviceJsPath: 's.js',
+        oldPid: 1,
+        configPath: 'relative\\config.json',
+      }),
+    /absolute/,
+  )
+})
+
 test('buildLauncherArgv makes a failed WMI create both visible and diagnosable', () => {
   // The exit code is what the host reacts to, but "exited with code 1" alone is
   // the same message for WMI disabled, a missing PowerShell, and Access denied.
-  // Write-Error carries the ReturnValue out through stderr, which the host reads.
+  //
+  // The reason must NOT go through Write-Error: with stderr redirected, Windows
+  // PowerShell serialises the error stream as CLIXML, so the host would receive
+  // an XML document instead of a sentence. [Console]::Error.WriteLine bypasses
+  // that, and the sentinel pair lets the host find the line even though
+  // PowerShell still appends a CLIXML progress blob after it.
   const { args } = buildLauncherArgv('"C:\\node.exe" "C:\\svc.js" restart --pid 7')
   const script = Buffer.from(args[args.indexOf('-EncodedCommand') + 1], 'base64').toString('utf16le')
   assert.match(script, /ReturnValue/)
-  assert.match(script, /Write-Error/)
+  assert.match(script, /\[Console\]::Error\.WriteLine/)
+  assert.doesNotMatch(script, /Write-Error/)
+  assert.match(script, /dsh-autostart-launch-failed/)
   assert.match(script, /exit 1/)
 })
 
@@ -123,8 +146,10 @@ test(
     const code = await new Promise((resolve) => {
       const child = spawn(command, args, { stdio: 'ignore', windowsHide: true })
       child.once('exit', resolve)
-      child.once('error', () => resolve('spawn-error'))
+      child.once('error', (error) => resolve(`spawn-error: ${error.code ?? error.message}`))
     })
-    assert.notEqual(code, 0)
+    // Exactly 1: a spawn failure (no PowerShell) or a 0 would both mean the
+    // failure channel is broken, and `!== 0` would let the former pass.
+    assert.equal(code, 1)
   },
 )

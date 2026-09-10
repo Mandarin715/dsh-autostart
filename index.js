@@ -26,7 +26,12 @@ import {
 import { detectCommand } from './lib/detect-command.js'
 import { parseLatestAccessUrl } from './lib/parse-url.js'
 import { renderBootstrapVbs as renderBootstrap } from './lib/render-vbs.js'
-import { buildHelperCommandLine, buildLauncherArgv } from './lib/launch-helper.js'
+import {
+  buildHelperCommandLine,
+  buildLauncherArgv,
+  LAUNCH_FAILURE_PREFIX,
+  LAUNCH_FAILURE_SUFFIX,
+} from './lib/launch-helper.js'
 
 const SERVICE_JS = fileURLToPath(new URL('./service.js', import.meta.url))
 
@@ -58,7 +63,39 @@ const DEFAULT_LAUNCHER_TIMEOUT_MS = 15000
 /** Bounded tail of the launcher's stderr kept for diagnosing a launch failure. */
 const DEFAULT_LAUNCHER_STDERR_TAIL = 2000
 
+/** Longest diagnostic sentence passed on to the user. */
+const LAUNCH_DETAIL_MAX = 200
+
 const messageOf = (error) => (error instanceof Error ? error.message : String(error))
+
+/**
+ * Pull the launcher's one diagnostic sentence out of its stderr.
+ *
+ * Searching for the sentinel — rather than taking the last line — is required:
+ * with stderr redirected, Windows PowerShell appends a CLIXML blob AFTER anything
+ * we write, so "the last non-empty line" is an XML document (measured: ~1.4KB of
+ * <Objs> plus mojibake, which would otherwise be rendered into the settings card).
+ * Falls back to the last line for an older launcher, or a failure raised before
+ * our script ran.
+ */
+export function extractLaunchDetail(stderrTail, max = LAUNCH_DETAIL_MAX) {
+  const from = stderrTail.lastIndexOf(LAUNCH_FAILURE_PREFIX)
+  let text
+  if (from === -1) {
+    text = stderrTail
+      .split(/\r?\n/)
+      .filter((line) => line.trim() !== '')
+      .pop()
+  } else {
+    const rest = stderrTail.slice(from + LAUNCH_FAILURE_PREFIX.length)
+    const to = rest.indexOf(LAUNCH_FAILURE_SUFFIX)
+    text = to === -1 ? rest : rest.slice(0, to)
+  }
+  if (text === undefined) return ''
+  // Collapse whitespace and clamp: nothing from the launcher may reach the user as
+  // an unbounded or multi-line blob.
+  return text.replace(/\s+/g, ' ').trim().slice(0, max)
+}
 
 /**
  * Start the detached helper that waits for this process to exit and then
@@ -122,14 +159,9 @@ export async function defaultSpawnHelper(input, deps = {}) {
       clearTimeout(timer)
       settle(value)
     }
-    // The last non-empty stderr line is the actionable one (the launcher writes
-    // the WMI ReturnValue there).
     const detail = () => {
-      const line = stderrTail
-        .split(/\r?\n/)
-        .filter((text) => text.trim() !== '')
-        .pop()
-      return line === undefined ? '' : `: ${line.trim()}`
+      const flat = extractLaunchDetail(stderrTail)
+      return flat === '' ? '' : `: ${flat}`
     }
     const timer = setTimeout(() => {
       try {
@@ -143,7 +175,10 @@ export async function defaultSpawnHelper(input, deps = {}) {
     child.once('error', (error) =>
       finish(reject, new Error(`restart launcher failed: ${messageOf(error)}`)),
     )
-    child.once('exit', (code, signal) => {
+    // 'close' rather than 'exit': it fires once stdio has been fully drained, so
+    // the stderr tail above cannot be read half-written. The timeout still bounds
+    // the case where the stream never closes.
+    child.once('close', (code, signal) => {
       if (code === 0) {
         finish(resolve)
         return
@@ -310,7 +345,13 @@ export function createHandlers(deps) {
         // UTF-16LE with a BOM is what WSH parses as Unicode.
         fsImpl.writeFileSync(
           vbsPath,
-          `\uFEFF${renderBootstrap({ execPath: command.execPath, serviceJsPath: deps.serviceJsPath ?? SERVICE_JS })}`,
+          `\uFEFF${renderBootstrap({
+            execPath: command.execPath,
+            serviceJsPath: deps.serviceJsPath ?? SERVICE_JS,
+            // Same reason as the restart path: the login helper must not re-derive
+            // the DSH home from an environment it may not have inherited.
+            configPath: configFilePath(dshHome),
+          })}`,
           'utf16le',
         )
         registry.writeRunValue(vbsPath)

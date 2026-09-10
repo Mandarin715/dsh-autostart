@@ -1,7 +1,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { createHandlers, countRunningAgents, defaultSpawnHelper } from '../index.js'
+import { spawn } from 'node:child_process'
+import { buildLauncherArgv } from '../lib/launch-helper.js'
+import {
+  createHandlers,
+  countRunningAgents,
+  defaultSpawnHelper,
+  extractLaunchDetail,
+} from '../index.js'
 
 function fakeRes() {
   return {
@@ -230,7 +237,11 @@ function fakeLauncher({ exitCode = 0, signal = null, hang = false, stderrText = 
   // Fire only after the caller has had a chance to attach its listeners.
   setImmediate(() => {
     if (stderrText !== null) stderr.emit('data', stderrText)
-    if (!hang && handlers.exit) handlers.exit(exitCode, signal)
+    if (hang) return
+    // Model reality: 'exit' precedes 'close', and the code listens for the latter
+    // because that is when stdio has fully drained.
+    if (handlers.exit) handlers.exit(exitCode, signal)
+    if (handlers.close) handlers.close(exitCode, signal)
   })
   return child
 }
@@ -310,21 +321,73 @@ test('defaultSpawnHelper rejects when the launcher exits non-zero', async () => 
   )
 })
 
-test('defaultSpawnHelper names the cause when the launcher fails', async () => {
-  // Without this the user sees the same "code 1" for WMI disabled, a missing
-  // PowerShell and access denied — WMI is now a hard dependency of restart.
+test('defaultSpawnHelper extracts one short sentence, not a CLIXML blob', async () => {
+  // Measured reality: with stderr redirected, Windows PowerShell wraps the error
+  // stream as CLIXML, so a naive "last non-empty line" picks a ~1.4KB <Objs>
+  // document (plus mojibake) and the card renders the whole thing. The sentinel
+  // pair marks the one line worth keeping.
+  const clixml =
+    'dsh-autostart-launch-failed: ReturnValue=9 :dsh-autostart-launch-failed-end\r\n' +
+    '#< CLIXML\r\n' +
+    `<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">${'x'.repeat(1400)}</S></Objs>`
+  await assert.rejects(
+    () =>
+      defaultSpawnHelper(spawnInput(), {
+        spawnLauncher: () => fakeLauncher({ exitCode: 1, stderrText: clixml }),
+      }),
+    (error) => {
+      assert.match(error.message, /ReturnValue=9/)
+      assert.doesNotMatch(error.message, /CLIXML/)
+      assert.doesNotMatch(error.message, /<Objs/)
+      assert.ok(error.message.length < 300, `message was ${error.message.length} chars`)
+      return true
+    },
+  )
+})
+
+test('defaultSpawnHelper still reports a cause when there is no sentinel', async () => {
+  // An older launcher, or an error raised before our script runs, produces plain
+  // stderr with no sentinel: fall back to the last non-empty line.
   await assert.rejects(
     () =>
       defaultSpawnHelper(spawnInput(), {
         spawnLauncher: () =>
-          fakeLauncher({
-            exitCode: 1,
-            stderrText: 'junk line\nWin32_Process.Create failed, ReturnValue=9\n',
-          }),
+          fakeLauncher({ exitCode: 1, stderrText: 'junk\nout of memory\n' }),
       }),
-    /ReturnValue=9/,
+    /out of memory/,
   )
 })
+
+test(
+  'the real launcher yields one readable sentence, not a CLIXML blob',
+  { skip: process.platform === 'win32' ? false : 'Windows only' },
+  async () => {
+    // Run against the REAL powershell + WMI. This is the only way to see
+    // PowerShell's CLIXML stderr — the fake launcher cannot reproduce it — and it
+    // is what proves the sentinel survives the trip.
+    const { command, args } = buildLauncherArgv('"C:\\definitely\\missing\\no-such-exe.exe"')
+    const { code, stderr } = await new Promise((resolve) => {
+      const child = spawn(command, args, {
+        windowsHide: true,
+        stdio: ['ignore', 'ignore', 'pipe'],
+      })
+      let text = ''
+      child.stderr.setEncoding('utf8')
+      child.stderr.on('data', (chunk) => {
+        text += chunk
+      })
+      child.once('close', (exitCode) => resolve({ code: exitCode, stderr: text }))
+      child.once('error', (error) =>
+        resolve({ code: `spawn-error: ${error.code}`, stderr: text }),
+      )
+    })
+    assert.equal(code, 1, `real launcher exit code (stderr: ${stderr.slice(0, 200)})`)
+    const detail = extractLaunchDetail(stderr)
+    assert.match(detail, /ReturnValue=9/, `extracted: ${detail}`)
+    assert.ok(detail.length < 200, `extracted ${detail.length} chars: ${detail}`)
+    assert.doesNotMatch(detail, /CLIXML|<Objs/)
+  },
+)
 
 test('defaultSpawnHelper reports a killed launcher instead of "code null"', async () => {
   await assert.rejects(

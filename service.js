@@ -14,6 +14,7 @@ import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { isPortListening, waitForPort } from './lib/port.js'
 import { parseConfigFile, resolveDshHome, configFilePath } from './lib/config.js'
+import { powershellPath } from './lib/launch-helper.js'
 
 const SERVICE_JS = fileURLToPath(import.meta.url)
 
@@ -71,7 +72,9 @@ export function spawnDsh(config, log = () => {}, deps = {}) {
 function hookInvocation(script) {
   const ext = path.extname(script).toLowerCase()
   if (ext === '.ps1') {
-    return ['powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script]]
+    // Absolute for the same reason the launcher is: a bare name is resolved with
+    // the current directory searched first.
+    return [powershellPath(), ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script]]
   }
   if (ext === '.cmd' || ext === '.bat') return ['cmd.exe', ['/c', script]]
   return [script, []]
@@ -232,9 +235,11 @@ export async function main(argv, deps = {}) {
   // and resolveDshHome() would point at the wrong home entirely.
   const configFlag = argv.indexOf('--config')
   const named = configFlag === -1 ? null : argv[configFlag + 1]
-  if (configFlag !== -1 && (typeof named !== 'string' || named === '')) {
-    // Present but unusable. Falling back silently would reintroduce exactly the
-    // wrong-home failure this flag exists to prevent, so refuse instead.
+  if (configFlag !== -1 && (typeof named !== 'string' || named === '' || named.startsWith('-'))) {
+    // Present but unusable — including the `--config --pid 5` slip, where the
+    // next flag would otherwise be read as a path. Falling back silently would
+    // reintroduce exactly the wrong-home failure this flag exists to prevent, so
+    // refuse instead.
     return 2
   }
   const configPath = deps.configPath ?? named ?? configFilePath(resolveDshHome())

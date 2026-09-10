@@ -222,6 +222,7 @@ dsh-autostart/
     "argv": ["C:\\...\\@deepseek-ai\\dsh\\lib\\bin.js", "web", "--no-open"],
     "cwd": "C:\\Users\\<user>"
   },
+  "dshHome": "C:\\Users\\<user>\\.dsh",
   "dshPort": 3080,
   "hookScript": "",
   "openBrowserOnBoot": false,
@@ -234,6 +235,10 @@ dsh-autostart/
   }
 }
 ```
+
+`dshHome`(2026-09-10 新增)记录启用时解析出的 DSH home。它的作用是让**重启后的实例**不必
+依赖环境:`spawnDsh` 会用它重新断言 `DSH_HOME`(见 §3.2.1)。缺省 / 缺失时为 `null`,表示
+"不动环境",因此旧 `config.json` 继续可用。
 
 **契约稳定性**:`service.js` 只依赖上表字段。新增字段必须提供默认值,保证旧 `config.json` 仍可用。
 
@@ -421,10 +426,10 @@ sh.Run """<execPath>"" ""<serviceJs>"" start", 0, False
 | `lib/platform.js` | 非 Windows 拒绝;Windows 通过 |
 | `lib/detect-command.js` | 给定 argv 数组 → 正确切分 execPath/argv;`--no-open` 规范化(缺则补、`openBrowserOnBoot` 为真则不补) |
 | `lib/parse-url.js` | 从多行日志取**最后一条** `dsh web: http...?token=`;无匹配返回 null;容忍尾随空白/CRLF |
-| `lib/render-vbs.js` | 路径含空格时正确加引号;路径含反斜杠转义正确 |
+| `lib/render-vbs.js` | 路径含空格时正确加引号;路径含反斜杠转义正确;必须收到**绝对** `configPath` 并渲染进命令行(否则登录时助手会去推导 DSH home) |
 | `lib/registry.js` | 注册表 value 字符串构造正确(可注入假执行器测试,不触碰真实注册表) |
 | `lib/port.js` | 对已监听端口返回 true、未监听返回 false(用本进程临时监听一个端口做真实断言) |
-| `lib/config.js` | 默认值填充;非法值拒绝;旧版本 config 缺字段时用默认值 |
+| `lib/config.js` | 默认值填充;非法值拒绝;旧版本 config 缺字段时用默认值;`dshHome` 缺失时为 `null` |
 | `lib/launch-helper.js` | 含空格 / 单引号 / 尾随反斜杠的路径加引号正确;非正整数 pid 与缺失 `configPath` 被拒;启动器走**绝对路径** powershell 且用 `-EncodedCommand` 承载 `Win32_Process.Create`,失败时既非 0 退出、又经 `Write-Error` 带出 ReturnValue;**用真实启动器**对不存在的 exe 断言退出码非 0 |
 | Job / 环境边界(`index.js` + `service.js`) | 助手经 WMI 在 Job 外创建;启动失败/超时/非 0 → 路由 500 且**不退出**;并发两次重启只得到一次 202、只起一个助手;重启路由把 `configFilePath(dshHome)` 作为 `--config` 传入;`spawnDsh` 按 config.json 的 `dshHome` 重新断言 `DSH_HOME`,缺省时不动环境 |
 
