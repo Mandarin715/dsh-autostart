@@ -25,7 +25,13 @@ export function readConfig(configPath) {
 }
 
 /** Launch DSH detached, with stdout/stderr appended to the log files. */
-export function spawnDsh(config) {
+export function spawnDsh(config, log = () => {}) {
+  // parseConfigFile does not validate logPaths (it cannot — it never receives
+  // dshHome), so guard it here: an unguarded openSync would throw a TypeError
+  // that escapes main's contract of returning an exit code.
+  if (typeof config?.logPaths?.out !== 'string' || typeof config?.logPaths?.err !== 'string') {
+    throw new Error('config: logPaths.out and logPaths.err are required to capture DSH output')
+  }
   const out = fs.openSync(config.logPaths.out, 'a')
   const err = fs.openSync(config.logPaths.err, 'a')
   const child = spawn(config.command.execPath, config.command.argv, {
@@ -33,6 +39,13 @@ export function spawnDsh(config) {
     detached: true,
     windowsHide: true,
     stdio: ['ignore', out, err],
+  })
+  // A bad execPath emits 'error'; with no listener Node rethrows it as an
+  // uncaught exception, killing this hidden login helper before it can report
+  // anything. Swallow it into the log and let the port wait below surface the
+  // failure as "did not come up".
+  child.once('error', (error) => {
+    log(`spawn error: ${error instanceof Error ? error.message : String(error)}`)
   })
   child.unref()
   return child.pid
@@ -96,7 +109,7 @@ export async function runStart(input) {
     log(`port ${config.dshPort} already running; skip start`)
     return { started: false }
   }
-  const pid = spawnImpl(config)
+  const pid = spawnImpl(config, log)
   log(`spawned dsh pid=${pid}`)
   const up = await wait(config.dshPort, { timeoutMs: config.startTimeoutMs })
   log(up ? `port ${config.dshPort} is up` : `WARN port ${config.dshPort} did not come up in time`)
@@ -139,11 +152,20 @@ export async function main(argv, deps = {}) {
     return 1
   }
   const log = makeLogger(config)
-  if (mode === 'start') {
-    await runStart({ config, log, deps })
-    return 0
+  // The mode dispatch runs inside a guard: spawnDsh and the logger touch the
+  // filesystem, and this function's contract is to RETURN an exit code. An
+  // unguarded throw would become an unhandled rejection in a hidden login
+  // process, which is invisible to the user.
+  try {
+    if (mode === 'start') {
+      await runStart({ config, log, deps })
+      return 0
+    }
+    return 2
+  } catch (error) {
+    log(`unexpected failure: ${error instanceof Error ? error.message : String(error)}`)
+    return 1
   }
-  return 2
 }
 
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : ''

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { runStart, runHook, main } from '../service.js'
+import { runStart, runHook, spawnDsh, main } from '../service.js'
 
 function baseConfig(overrides = {}) {
   return {
@@ -105,8 +105,48 @@ test('runHook maps .ps1/.cmd/.bat to their interpreters', async () => {
 })
 
 test('main rejects an unknown mode', async () => {
+  // 必须传 configPath:不传的话 main 会去读真实用户 home 的 config.json,
+  // 既拿不到测试期望的返回码,还会在用户真实 ~/.dsh 下写一个 service.log。
   const code = await main(['node', 'service.js', 'bogus'], {
     configPath: 'test/fixtures/config.json',
   })
   assert.equal(code, 2)
+})
+
+test('spawnDsh refuses a config without log paths instead of throwing a raw TypeError', () => {
+  // Throws before touching the filesystem or spawning anything, so this test
+  // launches nothing.
+  assert.throws(
+    () => spawnDsh({ command: { execPath: 'node.exe', argv: ['b.js'], cwd: '.' }, logPaths: {} }),
+    /logPaths/,
+  )
+})
+
+test('runStart hands the logger to the spawner so a spawn failure is reportable', async () => {
+  let receivedLog = null
+  await runStart({
+    config: baseConfig(),
+    log: () => {},
+    deps: {
+      isPortListening: async () => false,
+      waitForPort: async () => true,
+      spawnDsh: (config, log) => {
+        receivedLog = log
+        return 11
+      },
+      runHook: async () => ({ ran: false }),
+    },
+  })
+  assert.equal(typeof receivedLog, 'function')
+})
+
+test('main returns 1 rather than rejecting when the start path throws', async () => {
+  const code = await main(['node', 'service.js', 'start'], {
+    configPath: 'test/fixtures/config.json',
+    isPortListening: async () => false,
+    spawnDsh: () => {
+      throw new Error('boom')
+    },
+  })
+  assert.equal(code, 1)
 })
