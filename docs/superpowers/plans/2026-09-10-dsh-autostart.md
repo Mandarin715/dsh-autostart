@@ -1794,7 +1794,7 @@ git commit -m "feat: add service.js restart mode with pid wait"
 - Consumes: `lib/platform.js`、`lib/port.js`、`lib/config.js`、`lib/registry.js`、`lib/detect-command.js`、`lib/render-vbs.js`、`lib/parse-url.js`
 - Produces:
   - `buildState(input): Promise<object>`(见 Step 3 字段定义)
-  - `sameOrigin(headers): boolean`
+  - `sameOrigin(headers, expectedPort?): boolean`(并要求 Host 为回环权威)
   - `createHandlers(deps): { state, enable, disable, restart }`
   - `apply(ctx, config)`(Cordis 行入口)
   - `inject = ['webServer']`
