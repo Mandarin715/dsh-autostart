@@ -23,7 +23,9 @@ test('countRunningAgents counts only running agents', () => {
   const agents = { list: () => [{ status: 'running' }, { status: 'idle' }, { status: 'running' }] }
   assert.equal(countRunningAgents(agents), 2)
   assert.equal(countRunningAgents(undefined), 0)
-  assert.equal(countRunningAgents({}), 0)
+  // A service object with no usable list() is "cannot be read", not "nothing is
+  // running" — see the unknown-state test below. Stale pre-amendment assertion.
+  assert.equal(countRunningAgents({}), null)
 })
 
 test('restart refuses while a restart is already scheduled', async () => {
@@ -94,9 +96,24 @@ test('restart blocks when agents are running and the guard is on', async () => {
     cwd: 'C:\\work',
     agents: { list: () => [{ status: 'running' }] },
     spawnHelper: () => {},
+    // Returning 409 already short-circuits today, but if the gate ever regressed
+    // the default setTimeout(() => process.exit(0)) would arm a real exit and
+    // kill the test runner — so inject a no-op.
+    scheduleExit: () => {},
   })
   const res = fakeRes()
   await handlers.restart(req(), res)
   assert.equal(res.statusCode, 409)
   assert.match(res.body, /agent/i)
+})
+
+test('countRunningAgents reports unknown rather than zero when the list cannot be read', () => {
+  // This backs a protection the user explicitly opted into: when the agent list
+  // cannot be read the result must be "unknown", never 0 — 0 would silently lift
+  // the protection, which is the unsafe direction.
+  assert.equal(countRunningAgents(undefined), 0)
+  assert.equal(countRunningAgents({ list: () => [] }), 0)
+  assert.equal(countRunningAgents({ list: () => [{ status: 'running' }] }), 1)
+  assert.equal(countRunningAgents({ list: () => { throw new Error('boom') } }), null)
+  assert.equal(countRunningAgents({ list: () => 'not-an-array' }), null)
 })

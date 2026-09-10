@@ -31,16 +31,23 @@ import { renderBootstrapVbs as renderBootstrap } from './lib/render-vbs.js'
 
 const SERVICE_JS = fileURLToPath(new URL('./service.js', import.meta.url))
 
-/** Count agents that are mid-turn; used only to inform or gate a restart. */
+/**
+ * Count agents that are mid-turn; used only to inform or gate a restart.
+ *
+ * @returns the count, or `null` meaning "unknown" when the list cannot be read.
+ *   Never 0 on failure: `blockWhenAgentsRunning` is a protection the user
+ *   explicitly opted into, and reporting 0 would silently lift it — the unsafe
+ *   direction. The caller refuses the restart when the count is null.
+ */
 export function countRunningAgents(agentsService) {
   if (agentsService === undefined || agentsService === null) return 0
   let list
   try {
     list = agentsService.list?.()
   } catch {
-    return 0
+    return null
   }
-  if (!Array.isArray(list)) return 0
+  if (!Array.isArray(list)) return null
   return list.filter((agent) => agent?.status === 'running').length
 }
 
@@ -239,8 +246,11 @@ export function createHandlers(deps) {
         return
       }
       const running = countRunningAgents(deps.agents)
-      if (pluginConfig.blockWhenAgentsRunning && running > 0) {
-        send(res, 409, { error: `refusing to restart: ${running} agent(s) are running` })
+      if (pluginConfig.blockWhenAgentsRunning && (running === null || running > 0)) {
+        // null = the list could not be read. Refuse rather than assume zero:
+        // this gate is the user's explicit protection.
+        const detail = running === null ? 'the agent list is unreadable' : `${running} agent(s) are running`
+        send(res, 409, { error: `refusing to restart: ${detail}` })
         return
       }
       try {
