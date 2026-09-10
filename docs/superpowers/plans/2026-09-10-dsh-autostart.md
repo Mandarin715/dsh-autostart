@@ -1758,6 +1758,32 @@ test('enable writes config, vbs and the registry entry', async () => {
   assert.deepEqual(registryCalls, ['C:\\dsh\\dsh-autostart\\bootstrap.vbs'])
 })
 
+test('enable writes the vbs as UTF-16LE with a BOM so non-ASCII paths survive wscript', async () => {
+  const calls = []
+  const handlers = createHandlers({
+    platform: 'win32',
+    config: {},
+    dshHome: 'C:\\dsh',
+    serviceJsPath: 'C:\\p\\service.js',
+    execPath: 'node.exe',
+    argv: ['bin.js', 'web'],
+    cwd: 'C:\\work',
+    fs: {
+      mkdirSync: () => {},
+      writeFileSync: (file, data, encoding) => {
+        calls.push({ file, data, encoding })
+      },
+    },
+    registry: { writeRunValue: () => {} },
+  })
+  const res = fakeRes()
+  await handlers.enable(fakeReq(), res)
+  assert.equal(res.statusCode, 200)
+  const vbs = calls.find((call) => call.file.endsWith('bootstrap.vbs'))
+  assert.equal(vbs.encoding, 'utf16le')
+  assert.equal(vbs.data.charCodeAt(0), 0xfeff)
+})
+
 test('disable removes only our own registry entry', async () => {
   const removed = []
   const handlers = createHandlers({
@@ -1935,10 +1961,13 @@ export function createHandlers(deps) {
         const configFile = buildConfigFile({ command, pluginConfig, dshHome })
         fsImpl.writeFileSync(configFilePath(dshHome), JSON.stringify(configFile, null, 2), 'utf8')
         const vbsPath = path.join(dir, 'bootstrap.vbs')
+        // wscript.exe reads a BOM-less file as ANSI, so a non-ASCII path (a Chinese user
+        // profile, a non-ASCII DSH_HOME) would silently corrupt the login command.
+        // UTF-16LE with a BOM is what WSH parses as Unicode.
         fsImpl.writeFileSync(
           vbsPath,
-          renderBootstrap({ execPath: command.execPath, serviceJsPath: deps.serviceJsPath ?? SERVICE_JS }),
-          'utf8',
+          `\uFEFF${renderBootstrap({ execPath: command.execPath, serviceJsPath: deps.serviceJsPath ?? SERVICE_JS })}`,
+          'utf16le',
         )
         registry.writeRunValue(vbsPath)
         send(res, 200, { enabled: true, configPath: configFilePath(dshHome), vbsPath })
