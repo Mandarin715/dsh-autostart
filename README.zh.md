@@ -1,5 +1,7 @@
 # dsh-autostart
 
+[English](README.md) | 中文
+
 Windows 专用的 DeepSeek Harness 插件:在设置页一键启用「开机自动启动 DSH 服务」,并一键重启该服务。全程无控制台窗口。
 
 ## ⚠️ 免责声明(务必先读)

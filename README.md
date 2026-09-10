@@ -1,5 +1,7 @@
 # dsh-autostart
 
+English | [中文](README.zh.md)
+
 A Windows-only DeepSeek Harness plugin: enable "start the DSH service at boot" and restart that service from the settings page, one click each. No console window at any point.
 
 ## ⚠️ Disclaimer (read first)
