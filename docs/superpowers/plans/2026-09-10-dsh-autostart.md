@@ -1832,6 +1832,21 @@ test('sameOrigin accepts a matching origin and rejects others', () => {
   assert.equal(sameOrigin({}), false)
 })
 
+test('sameOrigin rejects a non-loopback Host even when Origin agrees with it', () => {
+  // DNS rebinding: a page served from evil.example:<port> whose domain then
+  // rebinds to 127.0.0.1:<port> presents a Host and an Origin that agree with
+  // each other, so equality alone would let it write HKCU\...\Run.
+  assert.equal(sameOrigin({ host: 'evil.example:3080', origin: 'http://evil.example:3080' }), false)
+  // Same for any other authority that is not this machine's loopback service.
+  assert.equal(sameOrigin({ host: '192.168.1.5:3080', origin: 'http://192.168.1.5:3080' }), false)
+})
+
+test('sameOrigin enforces the expected port when one is given', () => {
+  assert.equal(sameOrigin({ host: '127.0.0.1:3080', origin: 'http://127.0.0.1:3080' }, 3080), true)
+  assert.equal(sameOrigin({ host: 'localhost:3080', origin: 'http://localhost:3080' }, 3080), true)
+  assert.equal(sameOrigin({ host: '127.0.0.1:9999', origin: 'http://127.0.0.1:9999' }, 3080), false)
+})
+
 test('enable refuses on an unsupported platform', async () => {
   const handlers = createHandlers({
     platform: 'linux',
@@ -1841,6 +1856,25 @@ test('enable refuses on an unsupported platform', async () => {
     execPath: 'node.exe',
     argv: ['bin.js', 'web'],
     cwd: 'C:\\work',
+    // Throwing doubles: if the guard ever stops short-circuiting before the
+    // side effects, this test must fail loudly rather than write to the real
+    // registry or the real ~/.dsh.
+    fs: {
+      mkdirSync: () => {
+        throw new Error('must not touch the filesystem')
+      },
+      writeFileSync: () => {
+        throw new Error('must not touch the filesystem')
+      },
+    },
+    registry: {
+      writeRunValue: () => {
+        throw new Error('must not touch the registry')
+      },
+      removeRunValue: () => {
+        throw new Error('must not touch the registry')
+      },
+    },
   })
   const res = fakeRes()
   await handlers.enable(fakeReq(), res)
@@ -1849,9 +1883,64 @@ test('enable refuses on an unsupported platform', async () => {
 })
 
 test('enable refuses cross-origin POSTs', async () => {
-  const handlers = createHandlers({ platform: 'win32' })
+  const handlers = createHandlers({
+    platform: 'win32',
+    dshHome: 'C:\\dsh',
+    // Same throwing-double protection as the unsupported-platform test: this
+    // test exists to prove the guard refuses, so a broken guard must not be
+    // able to reach the real system.
+    fs: {
+      mkdirSync: () => {
+        throw new Error('must not touch the filesystem')
+      },
+      writeFileSync: () => {
+        throw new Error('must not touch the filesystem')
+      },
+    },
+    registry: {
+      writeRunValue: () => {
+        throw new Error('must not touch the registry')
+      },
+      removeRunValue: () => {
+        throw new Error('must not touch the registry')
+      },
+    },
+  })
   const res = fakeRes()
   await handlers.enable(fakeReq({ headers: { host: '127.0.0.1:3080', origin: 'http://evil.example' } }), res)
+  assert.equal(res.statusCode, 403)
+})
+
+test('enable refuses a rebinding-style request whose Host and Origin agree off-loopback', async () => {
+  const handlers = createHandlers({
+    platform: 'win32',
+    dshHome: 'C:\\dsh',
+    config: {},
+    execPath: 'node.exe',
+    argv: ['bin.js', 'web'],
+    cwd: 'C:\\work',
+    fs: {
+      mkdirSync: () => {
+        throw new Error('must not touch the filesystem')
+      },
+      writeFileSync: () => {
+        throw new Error('must not touch the filesystem')
+      },
+    },
+    registry: {
+      writeRunValue: () => {
+        throw new Error('must not touch the registry')
+      },
+      removeRunValue: () => {
+        throw new Error('must not touch the registry')
+      },
+    },
+  })
+  const res = fakeRes()
+  await handlers.enable(
+    fakeReq({ headers: { host: 'evil.example:3080', origin: 'http://evil.example:3080' } }),
+    res,
+  )
   assert.equal(res.statusCode, 403)
 })
 
@@ -1988,16 +2077,41 @@ import { parseLatestAccessUrl } from './lib/parse-url.js'
 
 const SERVICE_JS = fileURLToPath(new URL('./service.js', import.meta.url))
 
-/** Only same-origin writes are accepted: these endpoints can restart the host. */
-export function sameOrigin(headers) {
+/**
+ * Loopback hostnames the DSH web server is legitimately reachable at.
+ * A request whose Host is anything else is not addressed to this machine's own
+ * loopback service, regardless of what its Origin claims.
+ */
+export const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
+
+/**
+ * Whether a write request comes from this service's own page.
+ *
+ * Comparing `Origin` with `Host` alone proves nothing: both headers come from
+ * the caller, and under DNS rebinding they agree by construction — a page
+ * served from evil.example:<port> whose domain then rebinds to 127.0.0.1:<port>
+ * presents `Host: evil.example:<port>` with a matching Origin. So require the
+ * Host itself to be a loopback authority, and the port to be the one this
+ * plugin actually serves, before comparing the two.
+ *
+ * @param expectedPort - the plugin's configured dshPort; when given, the Host
+ *   must name exactly it.
+ */
+export function sameOrigin(headers, expectedPort) {
   const host = headers?.host
   const origin = headers?.origin
   if (typeof host !== 'string' || typeof origin !== 'string') return false
+  let hostUrl
+  let originUrl
   try {
-    return new URL(origin).host === host
+    hostUrl = new URL(`http://${host}`)
+    originUrl = new URL(origin)
   } catch {
     return false
   }
+  if (!LOOPBACK_HOSTNAMES.has(hostUrl.hostname)) return false
+  if (Number.isInteger(expectedPort) && hostUrl.port !== String(expectedPort)) return false
+  return originUrl.host === hostUrl.host
 }
 
 /** Read the newest access URL out of the captured stdout, if any. */
@@ -2057,7 +2171,7 @@ export function createHandlers(deps) {
       send(res, 400, { error: unsupportedReason(platform) })
       return false
     }
-    if (!sameOrigin(req.headers)) {
+    if (!sameOrigin(req.headers, pluginConfig.dshPort)) {
       send(res, 403, { error: 'same-origin request required' })
       return false
     }
@@ -2171,7 +2285,7 @@ function defaultSpawnHelper() {
 - [ ] **Step 4: 跑测试,确认通过**
 
 Run: `node --test test/host-routes.test.js`
-Expected: PASS(7 tests)(5 个原始路由用例 + VBS 编码用例 + 外来注册表项拒绝用例)
+Expected: PASS(10 tests)(7 个原始用例 + 修复轮新增的 2 个 sameOrigin 用例 + 1 个 rebinding 拒绝用例)
 
 - [ ] **Step 5: 语法检查**
 
