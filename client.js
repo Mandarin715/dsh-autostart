@@ -90,9 +90,10 @@ window.__ModuleLoader__.load({
 
     /**
      * Read a JSON body without trusting a Content-Type header: the host's send()
-     * sets none, so decode the text ourselves. An empty or non-JSON body (an
-     * error page returned by a proxy, say) becomes null, letting the caller fall
-     * back to the HTTP status instead of losing it to a parse failure.
+     * sets none, and Response.json() does not consult Content-Type anyway, so
+     * decode the text ourselves. An empty or non-JSON body (an error page
+     * returned by a proxy, say) becomes null, letting the caller fall back to
+     * the HTTP status instead of losing it to a parse failure.
      */
     function readJson(res) {
       return res.text().then((text) => {
@@ -201,7 +202,12 @@ window.__ModuleLoader__.load({
                     className: 'dsas_btn',
                     disabled: busy,
                     onClick: () => {
-                      navigator.clipboard?.writeText(url).then(() => {
+                      // Bind the promise before the optional chain ends: in a
+                      // non-secure context navigator.clipboard is undefined, and
+                      // `navigator.clipboard?.writeText(url).then(...)` still
+                      // dereferences `.then` on undefined and throws.
+                      const copyPromise = navigator.clipboard?.writeText(url)
+                      copyPromise?.then(() => {
                         setCopied(true)
                         setTimeout(() => setCopied(false), 2000)
                       })

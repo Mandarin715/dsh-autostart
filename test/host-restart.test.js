@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createHandlers, countRunningAgents } from '../index.js'
+import { createHandlers, countRunningAgents, defaultSpawnHelper } from '../index.js'
 
 function fakeRes() {
   return {
@@ -48,6 +48,9 @@ test('restart refuses while a restart is already scheduled', async () => {
 
 test('restart spawns the helper with the current pid', async () => {
   const calls = []
+  // Counted, not merely stubbed: spawning the helper is useless unless the exit
+  // that lets it restart us is actually armed, so pin that call too.
+  let exits = 0
   const handlers = createHandlers({
     platform: 'win32',
     dshHome: 'C:\\dsh',
@@ -56,13 +59,16 @@ test('restart spawns the helper with the current pid', async () => {
     cwd: 'C:\\work',
     currentPid: 4321,
     spawnHelper: (deps) => calls.push(deps),
-    scheduleExit: () => {},
+    scheduleExit: () => {
+      exits += 1
+    },
   })
   const res = fakeRes()
   await handlers.restart(req(), res)
   assert.equal(res.statusCode, 202)
   assert.equal(calls.length, 1)
   assert.equal(calls[0].oldPid, 4321)
+  assert.equal(exits, 1)
 })
 
 test('restart returns 500 and schedules no exit when the helper fails to spawn', async () => {
@@ -116,4 +122,59 @@ test('countRunningAgents reports unknown rather than zero when the list cannot b
   assert.equal(countRunningAgents({ list: () => [{ status: 'running' }] }), 1)
   assert.equal(countRunningAgents({ list: () => { throw new Error('boom') } }), null)
   assert.equal(countRunningAgents({ list: () => 'not-an-array' }), null)
+})
+
+test('restart refuses when the agent list cannot be read and the gate is on', async () => {
+  // This one guards the branch this fix wave is about: without it, reverting the
+  // gate to `running > 0` would still leave the whole suite green.
+  const handlers = createHandlers({
+    platform: 'win32',
+    dshHome: 'C:\\dsh',
+    config: { blockWhenAgentsRunning: true },
+    execPath: 'node.exe',
+    argv: ['bin.js', 'web'],
+    cwd: 'C:\\work',
+    agents: {
+      list: () => {
+        throw new Error('boom')
+      },
+    },
+    spawnHelper: () => {
+      throw new Error('must not spawn')
+    },
+    scheduleExit: () => {
+      throw new Error('must not schedule an exit')
+    },
+  })
+  const res = fakeRes()
+  await handlers.restart(req(), res)
+  assert.equal(res.statusCode, 409)
+  assert.match(res.body, /unreadable/)
+})
+
+test('defaultSpawnHelper fails synchronously when the helper or node is missing', () => {
+  // spawn's ENOENT arrives as an async 'error' event that try/catch cannot see;
+  // these two existence checks turn the common failures into synchronous throws,
+  // so the route can answer 500 instead of the host dying. Both checks throw
+  // before spawn, so this test launches no process.
+  assert.throws(
+    () =>
+      defaultSpawnHelper({
+        execPath: process.execPath,
+        serviceJsPath: 'C:\\definitely\\missing\\service.js',
+        cwd: '.',
+        oldPid: 1,
+      }),
+    /restart helper not found/,
+  )
+  assert.throws(
+    () =>
+      defaultSpawnHelper({
+        execPath: 'C:\\definitely\\missing\\node.exe',
+        serviceJsPath: import.meta.filename,
+        cwd: '.',
+        oldPid: 1,
+      }),
+    /node executable not found/,
+  )
 })

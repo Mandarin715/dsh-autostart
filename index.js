@@ -56,11 +56,26 @@ export function countRunningAgents(agentsService) {
  * restarts DSH. Detached + unref so it outlives this process.
  */
 export function defaultSpawnHelper(input) {
+  // spawn reports ENOENT/EACCES asynchronously as the child's 'error' event, so
+  // a try/catch around it cannot see them; and an 'error' with no listener is
+  // rethrown by Node and kills the host. So: first check the two paths we know
+  // synchronously, turning the common failures into throws the route can answer
+  // with 500, then attach an 'error' listener so no 'error' is ever unhandled.
+  if (!fs.existsSync(input.serviceJsPath)) {
+    throw new Error(`restart helper not found: ${input.serviceJsPath}`)
+  }
+  if (!fs.existsSync(input.execPath)) {
+    throw new Error(`node executable not found: ${input.execPath}`)
+  }
   const child = spawn(input.execPath, [input.serviceJsPath, 'restart', '--pid', String(input.oldPid)], {
     cwd: input.cwd,
     detached: true,
     windowsHide: true,
     stdio: 'ignore',
+  })
+  child.once('error', (error) => {
+    // The host has no logger; DSH collects the host's stdout/stderr.
+    console.error('[dsh-autostart] restart helper failed to start:', error)
   })
   child.unref()
 }
@@ -274,10 +289,14 @@ export function createHandlers(deps) {
 }
 
 /** Cordis row entry: mount the four routes on the web server. */
-export const inject = ['webServer']
+// `agents` must be injected and handed to createHandlers — without it the row
+// never supplies deps.agents, countRunningAgents always sees undefined and
+// returns 0, and blockWhenAgentsRunning becomes a protection that silently
+// does nothing.
+export const inject = ['webServer', 'agents']
 
 export function apply(ctx, config) {
-  const handlers = createHandlers({ config })
+  const handlers = createHandlers({ config, agents: ctx.get('agents') })
   ctx.effect(() => {
     const dispose = [
       ctx.webServer.register({ kind: 'exact', path: '/dsh-autostart/state', handler: handlers.state }),
