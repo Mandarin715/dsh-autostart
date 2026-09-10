@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "command": { "execPath": "node.exe", "argv": ["bin.js", "web", "--no-open"], "cwd": "." },
+  "dshPort": 3080,
+  "hookScript": "",
+  "startTimeoutMs": 1000,
+  "waitForExitMs": 1000,
+  "logPaths": { "out": "out.log", "err": "err.log", "service": "test/fixtures/service.log" }
+}
