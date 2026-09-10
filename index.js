@@ -26,6 +26,7 @@ import {
 import { detectCommand } from './lib/detect-command.js'
 import { parseLatestAccessUrl } from './lib/parse-url.js'
 import { renderBootstrapVbs as renderBootstrap } from './lib/render-vbs.js'
+import { buildHelperCommandLine, buildLauncherArgv } from './lib/launch-helper.js'
 
 const SERVICE_JS = fileURLToPath(new URL('./service.js', import.meta.url))
 
@@ -51,33 +52,75 @@ export function countRunningAgents(agentsService) {
   return list.filter((agent) => agent?.status === 'running').length
 }
 
+/** How long to wait for the WMI launcher to finish creating the helper. */
+const DEFAULT_LAUNCHER_TIMEOUT_MS = 15000
+
+const messageOf = (error) => (error instanceof Error ? error.message : String(error))
+
 /**
- * Spawn the detached helper that waits for this process to exit and then
- * restarts DSH. Detached + unref so it outlives this process.
+ * Start the detached helper that waits for this process to exit and then
+ * restarts DSH — created OUTSIDE this process's Windows job object.
+ *
+ * Node's `spawn(..., { detached: true })` is NOT sufficient: `detached` sets
+ * DETACHED_PROCESS but not CREATE_BREAKAWAY_FROM_JOB, so the helper stays a
+ * member of DSH's job object, which is created kill-on-close. DSH exiting would
+ * then kill the helper before it could start the replacement — i.e. "restart"
+ * would silently mean "shut down". (Measured on a real DSH: a detached child is
+ * still listed in the job's pid list, and killing the job kills it.)
+ *
+ * So the helper is created by the WMI service instead, which is not a DSH
+ * descendant; what it creates is outside the job and survives DSH's exit.
+ *
+ * The launch is AWAITED because the launcher itself runs inside the job: it has
+ * to have completed the WMI call before the caller exits. Every failure path is
+ * a rejection, so the route can answer 500 and — critically — not exit.
  */
-export function defaultSpawnHelper(input) {
-  // spawn reports ENOENT/EACCES asynchronously as the child's 'error' event, so
-  // a try/catch around it cannot see them; and an 'error' with no listener is
-  // rethrown by Node and kills the host. So: first check the two paths we know
-  // synchronously, turning the common failures into throws the route can answer
-  // with 500, then attach an 'error' listener so no 'error' is ever unhandled.
+export async function defaultSpawnHelper(input, deps = {}) {
+  // The existence checks stay first, so nothing is launched when a path is bad:
+  // a missing path would otherwise surface only as an async CreateProcess error.
   if (!fs.existsSync(input.serviceJsPath)) {
     throw new Error(`restart helper not found: ${input.serviceJsPath}`)
   }
   if (!fs.existsSync(input.execPath)) {
     throw new Error(`node executable not found: ${input.execPath}`)
   }
-  const child = spawn(input.execPath, [input.serviceJsPath, 'restart', '--pid', String(input.oldPid)], {
-    cwd: input.cwd,
-    detached: true,
-    windowsHide: true,
-    stdio: 'ignore',
+  const commandLine = buildHelperCommandLine(input)
+  const { command, args } = buildLauncherArgv(commandLine)
+  const spawnLauncher = deps.spawnLauncher ?? ((cmd, argv, options) => spawn(cmd, argv, options))
+  const timeoutMs = deps.launcherTimeoutMs ?? DEFAULT_LAUNCHER_TIMEOUT_MS
+
+  await new Promise((resolve, reject) => {
+    let child
+    try {
+      child = spawnLauncher(command, args, { windowsHide: true, stdio: 'ignore' })
+    } catch (error) {
+      reject(new Error(`could not start the restart launcher: ${messageOf(error)}`))
+      return
+    }
+    let settled = false
+    const finish = (settle, value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      settle(value)
+    }
+    const timer = setTimeout(() => {
+      try {
+        child.kill()
+      } catch {
+        // best effort: the timeout is already being reported
+      }
+      finish(reject, new Error(`the restart launcher did not finish within ${timeoutMs}ms`))
+    }, timeoutMs)
+    // An 'error' with no listener is rethrown by Node and would kill the host.
+    child.once('error', (error) =>
+      finish(reject, new Error(`restart launcher failed: ${messageOf(error)}`)),
+    )
+    child.once('exit', (code) => {
+      if (code === 0) finish(resolve)
+      else finish(reject, new Error(`the restart launcher exited with code ${code}`))
+    })
   })
-  child.once('error', (error) => {
-    // The host has no logger; DSH collects the host's stdout/stderr.
-    console.error('[dsh-autostart] restart helper failed to start:', error)
-  })
-  child.unref()
 }
 
 /**
@@ -298,7 +341,11 @@ export function createHandlers(deps) {
         return
       }
       try {
-        spawnHelper({
+        // Awaited on purpose: the launcher runs inside DSH's job, so it must
+        // finish handing the helper to the WMI service BEFORE this host exits.
+        // Fire-and-forget would let the exit kill the launcher mid-call, leaving
+        // nothing behind to bring DSH back.
+        await spawnHelper({
           execPath: deps.execPath ?? process.execPath,
           serviceJsPath: deps.serviceJsPath ?? SERVICE_JS,
           cwd: deps.cwd ?? process.cwd(),

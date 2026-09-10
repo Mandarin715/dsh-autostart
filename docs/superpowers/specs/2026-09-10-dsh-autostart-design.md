@@ -82,7 +82,7 @@
 | `PowerShell -WindowStyle Hidden` 对**常驻脚本**不可靠,会留下可见空控制台窗口 | 用户桌面出现无法关闭的空弹窗 | 用 **`wscript.exe` + VBS** 包装(仅此一处用 VBS) |
 | 固定 `Start-Sleep` 串起来的重启流程耗时 ~81s | "网页打不开"持续 1 分多钟 | **条件轮询**,无固定等待 |
 | DSH `0.1.2-rc.1` 每次启动生成**新的 launch token**,根路径强制校验 | 重启后网页 401,须去日志翻 token URL | 启动时**捕获 stdout 到日志**,UI 解析并展示 URL |
-| 用 `cmd /b` / 会话绑定的方式拉起脚本,进程随会话死亡 | 重启后服务没起来 | 一律 **detached + 独立进程** |
+| 用 `cmd /b` / 会话绑定的方式拉起脚本,进程随会话死亡 | 重启后服务没起来 | 一律 **独立进程**,且必须由 **Job 之外的服务**创建(见 §3.2) |
 | 幂等判断用 `:port`(会匹配 TIME_WAIT)导致误判"已在运行" | 服务其实没起来却跳过 | 幂等判断只看 **LISTENING** 状态 |
 | 第三方插件 `dsh-setting-restart` + 标记文件 + 常驻 watcher 共 4 个部件串联 | 部件多、状态易乱、标记易残留 | 本插件**自带按钮 + 自带 Node 助手**,部件降到 **2** |
 | PowerShell 脚本里的中文导致编码乱码、"字符串缺少终止符" | 脚本损坏 | 插件逻辑**全用 Node**,不写中文进 .ps1 |
@@ -116,14 +116,35 @@
 └──────────────────────────────────────────────┘
 ```
 
-**对比**:原方案有 4 个部件(第三方插件 + 标记文件 + 常驻 watcher + 脚本)。本设计**去掉 watcher 与标记文件**,因为它们存在的唯一理由是"第三方插件无法执行自定义逻辑";而本插件**自己就是那个逻辑**,于是宿主进程可以直接 spawn 助手,无需中转信号。
+**对比**:原方案有 4 个部件(第三方插件 + 标记文件 + 常驻 watcher + 脚本)。本设计**去掉 watcher 与标记文件**,因为它们存在的唯一理由是"第三方插件无法执行自定义逻辑";而本插件**自己就是那个逻辑**,于是宿主进程可以直接创建助手(经 WMI 落到 Job 之外,见 §3.2),无需中转信号。
 
 ### 3.2 为什么 `service.js` 必须是独立进程
 
 重启的本质是"**杀掉自己再把自己拉起来**"。宿主 DSH 进程调用 `process.exit(0)` 后,没有任何代码还能继续运行,因此:
 
 - 启动 DSH 的动作**必须**由一个**不属于该进程树**的助手完成
-- 助手由宿主 `spawn(..., { detached: true })` + `unref()` 启动,并**重定向 stdio 到日志**,确保宿主死亡后它仍在
+- 助手必须在宿主退出**之前**启动完毕,并重定向 stdio 到日志,确保宿主死亡后它仍在
+
+**⚠️ 实测更正(2026-09-10):`spawn(..., { detached: true })` 是不够的。**
+
+DSH 把自己的子进程放在一个 **Windows Job Object** 里,该 Job 带
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`(实测 `LimitFlags=0x2000`、`BREAKAWAY_OK=False`)。
+Node 的 `detached: true` 只设置 `DETACHED_PROCESS`,**不会**设置
+`CREATE_BREAKAWAY_FROM_JOB`,所以助手**仍然是该 Job 的成员**:
+宿主一退出 → Job 关闭 → 助手被一并杀掉 → **DSH 永久停摆**,
+即"重启"按钮实际等于"关机"按钮。(实测:枚举 Job 的 PID 列表,`detached` 起的子进程仍在其中。)
+
+因此助手必须由**另一个服务**代为创建。本插件用 **WMI**:
+`powershell -NoProfile -NonInteractive -EncodedCommand <base64>`,脚本体是
+`Invoke-CimMethod -ClassName Win32_Process -MethodName Create`。
+WMI provider host 不是 DSH 的后代,它创建的进程**不在** DSH 的 Job 里
+(实测:不在 Job 的 PID 列表内,且在 WMI host 卸载后仍存活)。
+
+由此产生两条硬性约束(§7 有对应错误行):
+
+1. 宿主必须 **await** 这次创建,不能 fire-and-forget —— 启动器本身也在 Job 里,
+   必须在宿主退出**之前**完成 WMI 调用。
+2. 创建失败 / 超时 / 启动器返回非 0 → **不得退出宿主**,否则"重启"就变成了"关机"。
 
 ### 3.3 组件职责与边界
 
@@ -239,7 +260,9 @@ dsh-autostart/
       3. 读取 `agents` 服务(ctx.get('agents')),统计 status === 'running' 的 Agent 数
          · blockWhenAgentsRunning 为真且计数 > 0 → 409(附计数)
          · 否则仅把计数写入日志(默认不阻止)
-      4. spawn detached: node <service.js> restart --pid <本进程 pid>
+      4. 经 WMI 在 Job 之外创建助手:node <service.js> restart --pid <本进程 pid>
+         · **必须 await 到该创建完成**(启动器自己也在 Job 里,宿主先退出会把它一起杀掉)
+         · 创建失败 / 超时 / 非 0 退出 → 500,且**不退出宿主**
       5. 返回 202 { accepted: true }
       6. 等 exitDelayMs(默认 800ms)→ process.exit(0)
   → service.js restart:
@@ -361,7 +384,8 @@ sh.Run """<execPath>"" ""<serviceJs>"" start", 0, False
 | 重启中重复点击 | 返回 409 | UI 提示"正在重启中" |
 | 等旧进程退出超时 | 中止重启(不启动第二实例),写日志 | 仅日志 |
 | 等端口起来超时 | 记录失败,不杀进程 | 仅日志 |
-| spawn 助手失败 | 返回 500,宿主**不退出**(避免把服务搞停) | UI 错误提示 |
+| 创建助手失败 / WMI 启动器超时或非 0 退出 | 返回 500,宿主**不退出**(避免把服务搞停) | UI 错误提示 |
+| 宿主在助手创建完成前退出 | **禁止**:创建必须 await,否则助手被 Job 一并杀掉(§3.2) | — |
 
 **总原则**:**DSH 服务本身优先于辅助功能**。任何钩子/日志/UI 层面的失败都不得阻止 DSH 起来;而任何会导致"服务消失"的操作都必须有明确的失败出口。
 
@@ -380,6 +404,7 @@ sh.Run """<execPath>"" ""<serviceJs>"" start", 0, False
 | `lib/registry.js` | 注册表 value 字符串构造正确(可注入假执行器测试,不触碰真实注册表) |
 | `lib/port.js` | 对已监听端口返回 true、未监听返回 false(用本进程临时监听一个端口做真实断言) |
 | `lib/config.js` | 默认值填充;非法值拒绝;旧版本 config 缺字段时用默认值 |
+| `lib/launch-helper.js` | 路径含空格时加引号;非正整数 pid 拒绝;启动器用 `-EncodedCommand` 承载 `Win32_Process.Create`,并把创建失败转成非 0 退出码;路径含单引号被转义(不能被当成脚本代码) |
 
 ### 8.2 语法门
 

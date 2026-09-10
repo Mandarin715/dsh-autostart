@@ -213,29 +213,142 @@ test('restart refuses when the agents service is absent and the gate is on', asy
   assert.match(res.body, /unreadable/)
 })
 
-test('defaultSpawnHelper fails synchronously when the helper or node is missing', () => {
-  // spawn's ENOENT arrives as an async 'error' event that try/catch cannot see;
-  // these two existence checks turn the common failures into synchronous throws,
-  // so the route can answer 500 instead of the host dying. Both checks throw
-  // before spawn, so this test launches no process.
-  assert.throws(
+/** A ChildProcess stand-in that records the listeners defaultSpawnHelper attaches. */
+function fakeLauncher({ exitCode = 0, hang = false } = {}) {
+  const handlers = {}
+  const child = {
+    once(event, cb) {
+      handlers[event] = cb
+      return child
+    },
+    kill() {},
+  }
+  // Fire only after the caller has had a chance to attach its listeners.
+  setImmediate(() => {
+    if (!hang && handlers.exit) handlers.exit(exitCode)
+  })
+  return child
+}
+
+/** Launch input whose two paths really exist, so the guard does not short-circuit. */
+function spawnInput(overrides = {}) {
+  return {
+    execPath: process.execPath,
+    serviceJsPath: import.meta.filename,
+    cwd: '.',
+    oldPid: 99,
+    ...overrides,
+  }
+}
+
+test('defaultSpawnHelper rejects when the helper or node is missing', async () => {
+  // The existence checks must run before anything is launched, so the route can
+  // answer 500 instead of exiting the host with no helper behind it. This is a
+  // rejection rather than a synchronous throw because the launch is awaited now:
+  // the launcher itself runs inside DSH's job, so it has to finish handing the
+  // helper to the WMI service before the exit that would kill it.
+  let launched = false
+  const deps = {
+    spawnLauncher: () => {
+      launched = true
+      return fakeLauncher()
+    },
+  }
+  await assert.rejects(
     () =>
-      defaultSpawnHelper({
-        execPath: process.execPath,
-        serviceJsPath: 'C:\\definitely\\missing\\service.js',
-        cwd: '.',
-        oldPid: 1,
-      }),
+      defaultSpawnHelper(
+        spawnInput({ serviceJsPath: 'C:\\definitely\\missing\\service.js' }),
+        deps,
+      ),
     /restart helper not found/,
   )
-  assert.throws(
-    () =>
-      defaultSpawnHelper({
-        execPath: 'C:\\definitely\\missing\\node.exe',
-        serviceJsPath: import.meta.filename,
-        cwd: '.',
-        oldPid: 1,
-      }),
+  await assert.rejects(
+    () => defaultSpawnHelper(spawnInput({ execPath: 'C:\\definitely\\missing\\node.exe' }), deps),
     /node executable not found/,
   )
+  assert.equal(launched, false, 'no launcher may start when a path is missing')
+})
+
+test('defaultSpawnHelper launches the helper through the WMI service', async () => {
+  // Not a plain detached spawn: `detached` was measured to leave the helper
+  // inside DSH's kill-on-close job, which is what turned "restart" into
+  // "shut down".
+  let captured = null
+  await defaultSpawnHelper(spawnInput({ oldPid: 99 }), {
+    spawnLauncher: (command, args, options) => {
+      captured = { command, args, options }
+      return fakeLauncher()
+    },
+  })
+  assert.equal(captured.command, 'powershell.exe')
+  assert.equal(captured.options.stdio, 'ignore')
+  const script = Buffer.from(
+    captured.args[captured.args.indexOf('-EncodedCommand') + 1],
+    'base64',
+  ).toString('utf16le')
+  assert.match(script, /Win32_Process/)
+  assert.match(script, /restart --pid 99/)
+})
+
+test('defaultSpawnHelper rejects when the launcher exits non-zero', async () => {
+  await assert.rejects(
+    () => defaultSpawnHelper(spawnInput(), { spawnLauncher: () => fakeLauncher({ exitCode: 1 }) }),
+    /code 1/,
+  )
+})
+
+test('defaultSpawnHelper rejects when the launcher never finishes', async () => {
+  // A hung launcher must not count as success: the host would then exit while
+  // the helper had never reached the WMI service.
+  await assert.rejects(
+    () =>
+      defaultSpawnHelper(spawnInput(), {
+        spawnLauncher: () => fakeLauncher({ hang: true }),
+        launcherTimeoutMs: 30,
+      }),
+    /did not finish/,
+  )
+})
+
+test('restart arms the exit only after the helper launch has completed', async () => {
+  // The launcher runs inside DSH's job, so it has to have FINISHED before DSH
+  // exits — otherwise the exit kills the launcher mid-call and nothing is left
+  // to restart DSH. This ordering is the difference between a restart button and
+  // a shutdown button.
+  let helperFinished = false
+  let finishedWhenExitArmed = null
+  const handlers = createHandlers(
+    restartDeps({
+      spawnHelper: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        helperFinished = true
+      },
+      scheduleExit: () => {
+        finishedWhenExitArmed = helperFinished
+      },
+    }),
+  )
+  const res = fakeRes()
+  await handlers.restart(req(), res)
+  assert.equal(res.statusCode, 202)
+  assert.equal(finishedWhenExitArmed, true, 'the exit was armed before the helper launch finished')
+})
+
+test('restart returns 500 and arms no exit when the helper rejects asynchronously', async () => {
+  let exits = 0
+  const handlers = createHandlers(
+    restartDeps({
+      spawnHelper: async () => {
+        throw new Error('launcher boom')
+      },
+      scheduleExit: () => {
+        exits += 1
+      },
+    }),
+  )
+  const res = fakeRes()
+  await handlers.restart(req(), res)
+  assert.equal(res.statusCode, 500)
+  assert.match(res.body, /launcher boom/)
+  assert.equal(exits, 0, 'a failed launch must not exit the host')
 })
