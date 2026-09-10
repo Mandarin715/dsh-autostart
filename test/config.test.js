@@ -79,3 +79,11 @@ test('parseConfigFile rejects malformed input', () => {
   assert.throws(() => parseConfigFile('not json'), /config/)
   assert.throws(() => parseConfigFile('{}'), /command/)
 })
+
+test('parseConfigFile rejects a null or array command instead of passing it through', () => {
+  // typeof null === 'object', so without an explicit check a hand-edited
+  // config.json would hand service.js a null command and it would throw an
+  // unhandled TypeError inside spawn() rather than the designed clean exit.
+  assert.throws(() => parseConfigFile('{"command":null}'), /command/)
+  assert.throws(() => parseConfigFile('{"command":[]}'), /command/)
+})
