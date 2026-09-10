@@ -3121,6 +3121,12 @@ dsh plugin --profile web add <本仓库路径或 github:mandarin715/dsh-autostar
 
 启用自启后点「重启服务」并**计时**。期望:数秒内页面恢复;`service.log` 含 `old process ... exited`、`spawned dsh pid=`、`port 3080 is up`;设置页「访问地址」已更新为新 token。
 
+> **为什么这一步是 2026-09-10 那个缺陷的回归位(必须按此判定)**:`port 3080 is up` 这一行是
+> **宿主已经退出之后**由助手写下的。若助手被留在 DSH 那个 kill-on-close 的 Job 里(spec §3.2),
+> 它会在宿主退出的瞬间被一并杀掉,日志就永远停在 `old process ... exited` 之后,页面也回不来。
+> 所以判定标准是:**必须亲眼看到 `port 3080 is up`**;只看到前两行 = 缺陷复发(表现为"重启即关机")。
+> 另外记录:页面恢复耗时(期望数秒,不是 ~80s),以及重启后 DSH 确实在 3080 上 LISTENING。
+
 - [ ] **Step 4: 跑 M4/M6(无窗口回归)**
 
 1. 在资源管理器里双击 `~/.dsh/dsh-autostart/bootstrap.vbs`
