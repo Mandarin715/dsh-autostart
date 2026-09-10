@@ -449,12 +449,24 @@ export function createHandlers(deps) {
 }
 
 /**
- * Remove the autostart entry on plugin unload — but only if it is still ours,
- * so an unrelated entry can never be deleted by accident.
+ * Remove the autostart entry — but ONLY on a real uninstall, and only if the entry
+ * is still ours.
+ *
+ * Disposal is not uninstallation: cordis tears a plugin row down on reload and on a
+ * failed load as well. Removing the entry then silently defeats the feature — the
+ * user enables autostart, something reloads, and the next login starts nothing.
+ * That was observed on a real machine after a failed load.
+ *
+ * Our own service.js being gone is the evidence of an actual uninstall. The
+ * generated bootstrap.vbs and config.json live outside node_modules, so without
+ * this check an uninstalled plugin would also leave a dangling entry pointing at a
+ * script that no longer exists.
  */
 export function cleanupAutostart(deps) {
   const dshHome = deps.dshHome ?? resolveDshHome()
   const registry = deps.registry ?? { readRunValue, removeRunValue }
+  const exists = deps.exists ?? fs.existsSync
+  const serviceJsPath = deps.serviceJsPath ?? SERVICE_JS
   const vbsPath = path.join(configDir(dshHome), 'bootstrap.vbs')
   let stored
   try {
@@ -463,6 +475,7 @@ export function cleanupAutostart(deps) {
     return
   }
   if (stored === null || !isOurEntry(stored, vbsPath)) return
+  if (exists(serviceJsPath)) return
   try {
     registry.removeRunValue()
   } catch {
@@ -498,7 +511,7 @@ export function apply(ctx, config) {
     ]
     return () => {
       for (const fn of dispose) fn()
-      cleanupAutostart({})
+      cleanupAutostart({ serviceJsPath: SERVICE_JS })
     }
   }, 'dsh-autostart: routes')
 }
