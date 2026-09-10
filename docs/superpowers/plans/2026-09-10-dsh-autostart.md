@@ -264,7 +264,7 @@ test('returns true for a listening port', async () => {
   const server = await listenOnce()
   const port = server.address().port
   assert.equal(await isPortListening(port), true)
-  server.close()
+  await new Promise((r) => server.close(r))
 })
 
 test('returns false for a closed port', async () => {
@@ -278,7 +278,7 @@ test('waitForPort resolves true once the port opens', async () => {
   const server = await listenOnce()
   const port = server.address().port
   assert.equal(await waitForPort(port, { timeoutMs: 2000, intervalMs: 50 }), true)
-  server.close()
+  await new Promise((r) => server.close(r))
 })
 
 test('waitForPort resolves false on timeout', async () => {
