@@ -20,7 +20,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test/",
+    "test": "node --test",
     "check": "node --check index.js && node --check client.js && node --check service.js"
   },
   "keywords": [
