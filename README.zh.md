@@ -97,6 +97,61 @@ dsh plugin --profile web add github:Mandarin715/dsh-autostart
 > **注册表项不会因为改配置而消失。** 插件只在自己**真的被卸载**时(判据:本插件的 `service.js`
 > 已不存在)才移除 `DSH autostart`;DSH 因重载或加载失败而拆解插件树时**保留**它。
 
+## 和已有的开机自启项如何共存(重要)
+
+本插件**只管 DSH**。如果你原本已经有自己的开机自启项(例如 `HKCU\...\Run` 里的 `DSH Web`、
+`DSH frpc`、`DSH authproxy`),那么启用本插件的自启之后,**会有两条自启项都想在登录时拉起 DSH**。
+
+- ✅ **不会互相覆盖**:本插件只写、也只删自己那一条 `DSH autostart`,不碰你的条目(实测:启用后原有条目一字未动)。
+- ⚠️ **但会重复**:两者都靠"端口已在监听就跳过"去重,所以最终只会有一个 DSH;然而存在一个**窄竞态** ——
+  两条几乎同时跑、都在对方绑定端口之前探测到"未监听",于是都去拉起,其中一个因端口被占用而失败退出
+  (无害,但会留下一次失败记录与可能的残留进程)。
+
+### 做法 A:只留本插件(简单)
+
+删掉你自己的 DSH 启动项:
+
+```powershell
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "DSH Web" /f
+```
+
+然后回设置页点一次「启用自启」。
+
+> ⚠️ **不要顺手删掉 `DSH frpc` / `DSH authproxy`** —— 本插件**不管** frpc 和 auth-proxy。
+> 手机远程若依赖它们,删掉就会失去自启。要合并请用做法 B。
+
+### 做法 B:合并成「一条自启 + 一个钩子」(维护面最小)
+
+钩子在**开机与每次重启之后**都会执行,所以把"确保其他进程在跑"的逻辑放进去,自启就只需要本插件这一条。
+
+1. 写一个钩子,例如 `~/.dsh/hooks/after-service-up.ps1`:
+
+   ```powershell
+   # 服务起来后,确保其余依赖进程在跑(路径按你自己的改)
+   & "$env:USERPROFILE\.dsh\scripts\start-frpc.ps1"
+   & "$env:USERPROFILE\.dsh\scripts\start-authproxy.ps1"
+   ```
+
+2. 在 profile 的 `cordis.patch.yml` 里指向它:
+
+   ```yaml
+   - id: dsh-autostart
+     name: dsh-autostart
+     config:
+       hookScript: 'C:\Users\<you>\.dsh\hooks\after-service-up.ps1'
+   ```
+
+3. 回设置页**重新点一次「启用自启」**(`hookScript` 是启用时快照进 `config.json` 的),
+   再删掉 `DSH Web` / `DSH frpc` / `DSH authproxy` 三条,只留插件的 `DSH autostart`。
+
+> 钩子失败**不会**阻断 DSH 启动(只记日志),所以钩子里各步骤可以独立失败。
+> 确认钩子跑了没:看 `~/.dsh/dsh-autostart/service.log` 里的 `hook exited code=…`。
+
+| 你原有的自启项 | 做法 A | 做法 B |
+|---|---|---|
+| `DSH Web`(负责拉 DSH) | 删掉 | 删掉 |
+| `DSH frpc` / `DSH authproxy` | **保留** | 删掉,改由钩子负责 |
+
 ## 生成物位置
 
 ```

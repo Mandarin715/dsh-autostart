@@ -102,6 +102,65 @@ Loopback keeps the strict port check.
 > is genuinely uninstalled (evidence: its own `service.js` is gone); when DSH tears the plugin tree down for a reload or a
 > failed load, the entry is **kept**.
 
+## Coexisting with an autostart entry you already have (important)
+
+This plugin manages **DSH only**. If you already have your own boot entries (for example `DSH Web`, `DSH frpc`,
+`DSH authproxy` under `HKCU\...\Run`), then after enabling this plugin's autostart **two entries will both try to
+start DSH at login**.
+
+- ✅ **They do not overwrite each other**: this plugin writes and deletes only its own `DSH autostart` value and never
+  touches yours (measured: after enabling, the user's other entries were untouched).
+- ⚠️ **But they do duplicate work**: both dedupe via "skip if the port is already listening", so you still end up with
+  one DSH — yet there is a **narrow race**: if both run and both probe before either binds the port, both will try to
+  launch, and one will fail because the port is taken (harmless, but it leaves a failure in the log and possibly a
+  stray process).
+
+### Option A: keep only this plugin (simple)
+
+Delete your own DSH entry:
+
+```powershell
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "DSH Web" /f
+```
+
+Then click Enable in the settings card.
+
+> ⚠️ **Do not also delete `DSH frpc` / `DSH authproxy`** — this plugin does **not** manage frpc or auth-proxy.
+> If phone access depends on them, deleting those entries loses their autostart. Use Option B to merge instead.
+
+### Option B: merge into "one autostart + one hook" (least to maintain)
+
+The hook runs **at boot and after every restart**, so put "make sure my other processes are running" in it and let
+this plugin be your only autostart entry.
+
+1. Write a hook, for example `~/.dsh/hooks/after-service-up.ps1`:
+
+   ```powershell
+   # once the service is up, make sure the other processes run (adjust the paths)
+   & "$env:USERPROFILE\.dsh\scripts\start-frpc.ps1"
+   & "$env:USERPROFILE\.dsh\scripts\start-authproxy.ps1"
+   ```
+
+2. Point the plugin at it in the profile's `cordis.patch.yml`:
+
+   ```yaml
+   - id: dsh-autostart
+     name: dsh-autostart
+     config:
+       hookScript: 'C:\Users\<you>\.dsh\hooks\after-service-up.ps1'
+   ```
+
+3. **Click Enable again** in the settings card (`hookScript` is snapshotted into `config.json` when you enable), then
+   delete `DSH Web` / `DSH frpc` / `DSH authproxy` and keep only this plugin's `DSH autostart`.
+
+> A failing hook does **not** block DSH (it is only logged), so its steps may fail independently.
+> To check whether it ran, look for `hook exited code=…` in `~/.dsh/dsh-autostart/service.log`.
+
+| Your existing entry | Option A | Option B |
+|---|---|---|
+| `DSH Web` (starts DSH) | delete | delete |
+| `DSH frpc` / `DSH authproxy` | **keep** | delete; the hook takes over |
+
 ## Generated files
 
 ```

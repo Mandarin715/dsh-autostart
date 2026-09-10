@@ -1,7 +1,7 @@
 # 真机验收记录 (Task 14 / spec §8.3)
 
 **日期**:2026-09-10
-**环境**:Windows 桌面会话 · DSH `0.1.5-rc.1` · Node v24 · 插件以 `link:C:/Users/asus/Desktop/dsh-autostart` 安装(`feat/implementation`,HEAD `34ad1f2`)
+**环境**:Windows 桌面会话 · DSH `0.1.5-rc.1` · Node v24 · 插件以 `link:<repo path>` 安装(`feat/implementation`,HEAD `34ad1f2`)
 
 ## 执行方式说明(与计划书的差异)
 
