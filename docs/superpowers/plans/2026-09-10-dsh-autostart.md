@@ -2293,10 +2293,14 @@ export function createHandlers(deps) {
 }
 
 /** Cordis row entry: mount the four routes on the web server. */
-export const inject = ['webServer']
+// `agents` must be injected and handed to createHandlers — without it the row
+// never supplies deps.agents, countRunningAgents always sees undefined and
+// returns 0, and blockWhenAgentsRunning becomes a protection that silently
+// does nothing.
+export const inject = ['webServer', 'agents']
 
 export function apply(ctx, config) {
-  const handlers = createHandlers({ config })
+  const handlers = createHandlers({ config, agents: ctx.get('agents') })
   ctx.effect(() => {
     const dispose = [
       ctx.webServer.register({ kind: 'exact', path: '/dsh-autostart/state', handler: handlers.state }),
@@ -2368,7 +2372,7 @@ git commit -m "feat: add host state aggregation and autostart routes"
 ```js
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createHandlers, countRunningAgents } from '../index.js'
+import { createHandlers, countRunningAgents, defaultSpawnHelper } from '../index.js'
 
 function fakeRes() {
   return {
@@ -2483,6 +2487,59 @@ test('countRunningAgents reports unknown rather than zero when the list cannot b
   assert.equal(countRunningAgents({ list: () => { throw new Error('boom') } }), null)
   assert.equal(countRunningAgents({ list: () => 'not-an-array' }), null)
 })
+
+test('restart refuses when the agent list cannot be read and the gate is on', async () => {
+  // 这一条守的是本轮修复的核心分支:没有它,把门改回 `running > 0` 仍然全绿。
+  const handlers = createHandlers({
+    platform: 'win32',
+    dshHome: 'C:\\dsh',
+    config: { blockWhenAgentsRunning: true },
+    execPath: 'node.exe',
+    argv: ['bin.js', 'web'],
+    cwd: 'C:\\work',
+    agents: {
+      list: () => {
+        throw new Error('boom')
+      },
+    },
+    spawnHelper: () => {
+      throw new Error('must not spawn')
+    },
+    scheduleExit: () => {
+      throw new Error('must not schedule an exit')
+    },
+  })
+  const res = fakeRes()
+  await handlers.restart(req(), res)
+  assert.equal(res.statusCode, 409)
+  assert.match(res.body, /unreadable/)
+})
+
+test('defaultSpawnHelper fails synchronously when the helper or node is missing', () => {
+  // spawn 的 ENOENT 是异步 'error' 事件,try/catch 收不到;这两个存在性检查让
+  // 常见失败变成同步抛出,从而能真正返回 500 而不是崩掉宿主。
+  // 两项检查都在 spawn 之前抛出,所以这个测试不会启动任何进程。
+  assert.throws(
+    () =>
+      defaultSpawnHelper({
+        execPath: process.execPath,
+        serviceJsPath: 'C:\\definitely\\missing\\service.js',
+        cwd: '.',
+        oldPid: 1,
+      }),
+    /restart helper not found/,
+  )
+  assert.throws(
+    () =>
+      defaultSpawnHelper({
+        execPath: 'C:\\definitely\\missing\\node.exe',
+        serviceJsPath: import.meta.filename,
+        cwd: '.',
+        oldPid: 1,
+      }),
+    /node executable not found/,
+  )
+})
 ```
 
 - [ ] **Step 2: 跑测试,确认失败**
@@ -2522,11 +2579,25 @@ export function countRunningAgents(agentsService) {
  * restarts DSH. Detached + unref so it outlives this process.
  */
 export function defaultSpawnHelper(input) {
+  // spawn 把 ENOENT/EACCES 作为子进程的 'error' 事件**异步**上报,try/catch 看不见;
+  // 而没有监听器的 'error' 会被 Node 重新抛出,直接把宿主进程打死。
+  // 所以:先同步校验两个我们自己知道的路径,让常见失败变成可返回 500 的同步抛出;
+  // 再挂上 'error' 监听,绝不留下未处理的 'error'。
+  if (!fs.existsSync(input.serviceJsPath)) {
+    throw new Error(`restart helper not found: ${input.serviceJsPath}`)
+  }
+  if (!fs.existsSync(input.execPath)) {
+    throw new Error(`node executable not found: ${input.execPath}`)
+  }
   const child = spawn(input.execPath, [input.serviceJsPath, 'restart', '--pid', String(input.oldPid)], {
     cwd: input.cwd,
     detached: true,
     windowsHide: true,
     stdio: 'ignore',
+  })
+  child.once('error', (error) => {
+    // 宿主没有 logger;DSH 会把 stdout/stderr 收进 dsh-web-server.err.log。
+    console.error('[dsh-autostart] restart helper failed to start:', error)
   })
   child.unref()
 }
@@ -2577,7 +2648,7 @@ export function defaultSpawnHelper(input) {
 - [ ] **Step 4: 跑测试,确认通过**
 
 Run: `node --test test/host-restart.test.js`
-Expected: PASS(6 tests)(5 个原始用例 + 1 个 countRunningAgents 未知态用例)
+Expected: PASS(8 tests)(5 个原始用例 + countRunningAgents 未知态 + 门在未知态拒绝 + spawnHelper 同步失败)
 
 - [ ] **Step 5: 跑全部测试 + 语法检查**
 
