@@ -1,0 +1,4 @@
+# dsh-autostart bundle patch: one host row over the web profile.
+- insert:
+    - id: dsh-autostart
+      name: dsh-autostart
