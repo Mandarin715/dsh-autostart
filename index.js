@@ -54,8 +54,12 @@ export const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::
  *
  * @param expectedPort - the plugin's configured dshPort; when given, the Host
  *   must name exactly it.
+ * @param allowedHosts - extra authorities the user explicitly trusts, for
+ *   reaching DSH through a reverse proxy (frp + auth-proxy forwards the
+ *   original Host, so the browser sends the public domain, not loopback).
+ *   The port and same-origin checks still apply to these.
  */
-export function sameOrigin(headers, expectedPort) {
+export function sameOrigin(headers, expectedPort, allowedHosts = []) {
   const host = headers?.host
   const origin = headers?.origin
   if (typeof host !== 'string' || typeof origin !== 'string') return false
@@ -67,7 +71,17 @@ export function sameOrigin(headers, expectedPort) {
   } catch {
     return false
   }
-  if (!LOOPBACK_HOSTNAMES.has(hostUrl.hostname)) return false
+  const trusted = Array.isArray(allowedHosts)
+    ? allowedHosts.some((entry) => {
+        // The plan documents entries as bare hostnames (['derp.example.com'])
+        // while the listing compares them as full authorities; accept both so a
+        // user following either form is admitted. The port and same-origin
+        // checks below still bind whichever form matched.
+        const configured = String(entry).toLowerCase()
+        return configured === hostUrl.host.toLowerCase() || configured === hostUrl.hostname.toLowerCase()
+      })
+    : false
+  if (!LOOPBACK_HOSTNAMES.has(hostUrl.hostname) && !trusted) return false
   if (Number.isInteger(expectedPort) && hostUrl.port !== String(expectedPort)) return false
   return originUrl.host === hostUrl.host
 }
@@ -129,7 +143,7 @@ export function createHandlers(deps) {
       send(res, 400, { error: unsupportedReason(platform) })
       return false
     }
-    if (!sameOrigin(req.headers, pluginConfig.dshPort)) {
+    if (!sameOrigin(req.headers, pluginConfig.dshPort, pluginConfig.allowedHosts)) {
       send(res, 403, { error: 'same-origin request required' })
       return false
     }

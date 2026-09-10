@@ -41,6 +41,35 @@ test('sameOrigin enforces the expected port when one is given', () => {
   assert.equal(sameOrigin({ host: '127.0.0.1:9999', origin: 'http://127.0.0.1:9999' }, 3080), false)
 })
 
+test('sameOrigin admits an explicitly trusted reverse-proxy authority, and only that one', () => {
+  const allowed = ['derp.example.com']
+  // A user reaching DSH through frp + auth-proxy: the proxy forwards the
+  // original Host, so the browser sends the public domain rather than loopback.
+  assert.equal(
+    sameOrigin({ host: 'derp.example.com:3080', origin: 'http://derp.example.com:3080' }, 3080, allowed),
+    true,
+  )
+  // Trusting one authority must not open the door to another.
+  assert.equal(
+    sameOrigin({ host: 'evil.example:3080', origin: 'http://evil.example:3080' }, 3080, allowed),
+    false,
+  )
+  // The port and same-origin conditions still bind a trusted authority.
+  assert.equal(
+    sameOrigin({ host: 'derp.example.com:9999', origin: 'http://derp.example.com:9999' }, 3080, allowed),
+    false,
+  )
+  assert.equal(
+    sameOrigin({ host: 'derp.example.com:3080', origin: 'http://other.example:3080' }, 3080, allowed),
+    false,
+  )
+  // With no allow-list configured, the same request is refused.
+  assert.equal(
+    sameOrigin({ host: 'derp.example.com:3080', origin: 'http://derp.example.com:3080' }, 3080),
+    false,
+  )
+})
+
 test('enable refuses on an unsupported platform', async () => {
   const handlers = createHandlers({
     platform: 'linux',

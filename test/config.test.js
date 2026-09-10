@@ -93,3 +93,11 @@ test('parseConfigFile rejects a command missing its own fields', () => {
   assert.throws(() => parseConfigFile('{"command":{"execPath":"n","argv":["b"],"cwd":""}}'), /command/)
   assert.throws(() => parseConfigFile('{"command":{"execPath":"n","argv":[],"cwd":"c"}}'), /command/)
 })
+
+test('resolvePluginConfig validates allowedHosts', () => {
+  assert.deepEqual(resolvePluginConfig().allowedHosts, [])
+  assert.deepEqual(resolvePluginConfig({ allowedHosts: ['derp.example.com'] }).allowedHosts, ['derp.example.com'])
+  assert.throws(() => resolvePluginConfig({ allowedHosts: 'derp.example.com' }), /allowedHosts/)
+  assert.throws(() => resolvePluginConfig({ allowedHosts: [''] }), /allowedHosts/)
+  assert.throws(() => resolvePluginConfig({ allowedHosts: [42] }), /allowedHosts/)
+})
