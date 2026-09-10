@@ -87,3 +87,9 @@ test('parseConfigFile rejects a null or array command instead of passing it thro
   assert.throws(() => parseConfigFile('{"command":null}'), /command/)
   assert.throws(() => parseConfigFile('{"command":[]}'), /command/)
 })
+
+test('parseConfigFile rejects a command missing its own fields', () => {
+  assert.throws(() => parseConfigFile('{"command":{}}'), /command/)
+  assert.throws(() => parseConfigFile('{"command":{"execPath":"n","argv":["b"],"cwd":""}}'), /command/)
+  assert.throws(() => parseConfigFile('{"command":{"execPath":"n","argv":[],"cwd":"c"}}'), /command/)
+})
