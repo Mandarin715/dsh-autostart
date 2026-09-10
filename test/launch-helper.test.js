@@ -75,6 +75,21 @@ test('powershellPath is absolute, so CreateProcess cannot run a local impostor',
   assert.match(powershellPath({ env: {} }), /^[A-Za-z]:\\/)
 })
 
+test('buildLauncherArgv asks WMI for a HIDDEN window', () => {
+  // Win32_Process.Create gives a console-subsystem program a VISIBLE console by
+  // default. Measured on a machine whose default terminal is Windows Terminal:
+  // without startup information a visible CASCADIA_HOSTING_WINDOW_CLASS window
+  // appeared (and the terminal window does not close with the child, so it
+  // lingers); with ProcessStartupInformation.ShowWindow = 0 the console window is
+  // created hidden. "No console window at any point" is this plugin's headline
+  // promise, so this assertion is load-bearing, not cosmetic.
+  const { args } = buildLauncherArgv('"C:\\node.exe" "C:\\svc.js" restart --pid 7')
+  const script = Buffer.from(args[args.indexOf('-EncodedCommand') + 1], 'base64').toString('utf16le')
+  assert.match(script, /Win32_ProcessStartup/)
+  assert.match(script, /ShowWindow\s*=\s*0/)
+  assert.match(script, /\.Create\(/)
+})
+
 test('buildLauncherArgv asks the WMI service to create the helper process', () => {
   const helperLine = '"C:\\node.exe" "C:\\svc.js" restart --pid 7'
   const { command, args } = buildLauncherArgv(helperLine)
@@ -85,9 +100,12 @@ test('buildLauncherArgv asks the WMI service to create the helper process', () =
 
   const encoded = args[args.indexOf('-EncodedCommand') + 1]
   const script = Buffer.from(encoded, 'base64').toString('utf16le')
-  assert.match(script, /Invoke-CimMethod/)
+  // [wmiclass] rather than Invoke-CimMethod: the CIM cmdlet could not bind
+  // ProcessStartupInformation ("类型不匹配"), and the startup information is what
+  // suppresses the console window.
+  assert.match(script, /wmiclass/)
   assert.match(script, /Win32_Process/)
-  assert.match(script, /-MethodName Create/)
+  assert.ok(script.includes('Win32_ProcessStartup'), 'the startup information must be requested')
   // The helper command line has to survive as data, single-quoted for PowerShell.
   assert.ok(script.includes(`'${helperLine}'`), `script did not carry the helper line: ${script}`)
 })

@@ -27,7 +27,7 @@
 | M2 停用自启 | **通过** | 返回 `{"enabled":false}`;注册表条目消失;**原有四条一字未动**;再启用可回到 `autostartEnabled:true` |
 | M3 重启服务 | **通过** | `POST /dsh-autostart/restart` → **202**;助手 `service.log`:`old process 33608 exited` → `spawned dsh pid=20476` → **`port 3080 is up`**(宿主死后由助手写下 —— 这正是曾经不可能的一行);新 DSH 的父进程已消失(= 助手退出、DSH 存活);耗时约 **6.5s** |
 | —— `accessUrl` 刷新 | **通过** | 重启后 `state.accessUrl` 从旧 token 变为 `http://127.0.0.1:3080/?token=XfnRWbASvVAOxGev2pTyhBC76E4W_np_I2RPSFbUpls`,与插件自己捕获的日志一致 |
-| M4/M6 无控制台窗口 | **未验证(需人工)** | 需在重启瞬间肉眼确认;机制上走 `wscript` + `service.js`,不经 PowerShell 窗口 |
+| M4/M6 无控制台窗口 | **实测失败 → 已修** | 用户肉眼确认"cmd 窗口弹出来再消失",且事后仍有窗口留在前台;根因与修复见发现 F6 |
 | M5 钩子失败不阻断 | **通过** | `hookScript` 指向不存在路径后重启,`service.log` 末行 `hook not found: C:\definitely\missing\hook.ps1`,而 DSH **正常起来**并在 3080 监听 |
 | M7 卸载清理 | **未通过 UI 验证** | `dispose → cleanupAutostart` 确实会删除条目(见下方事件中实际观察到),但"从 UI 卸载插件"这一步未由 agent 执行 |
 
@@ -90,6 +90,47 @@ cookie 跨重启依然有效、auth-proxy 用的是缓存。**一旦需要重新
 DSH 停在下线状态,需外部手段(本机 `restart-dsh-web.ps1` 或官方命令)拉起。
 这与 spec §5.2 一致,但值得在 README 里对用户明说。
 
+### 发现 F6 —— WMI 创建的助手会开出可见控制台窗口(M4/M6 实测失败,已修)
+
+用户肉眼确认:重启时"cmd 窗口弹出来再消失",且事后仍有窗口留在前台。
+
+根因(靠**枚举顶层窗口**实测得出;`Process.MainWindowHandle` 回答不了这个问题 ——
+控制台窗口属于 `conhost`,不属于该进程):
+
+| 创建方式 | 结果 |
+|---|---|
+| 不带 startup info(**原实现**) | 出现 `CASCADIA_HOSTING_WINDOW_CLASS \| visible=True` → **可见** |
+| `ProcessStartupInformation.ShowWindow = 0` | 只有 `ConsoleWindowClass \| visible=False` → **隐藏** |
+
+`Win32_Process.Create` 默认给控制台子系统程序一个**可见**控制台;而本机默认终端是
+**Windows Terminal**,所以它不只是"闪一下":会新开一个可见窗口/标签页,并且
+**终端窗口不随子进程退出而关闭**,于是残留在前台。这正是 spec 头号承诺
+("全程无控制台窗口")被打破的地方。
+
+修复:`buildLauncherArgv` 改为
+
+```powershell
+$startup = ([wmiclass]'Win32_ProcessStartup').CreateInstance()
+$startup.ShowWindow = 0
+$r = ([wmiclass]'Win32_Process').Create('<cmdline>', $null, $startup)
+```
+
+用 `[wmiclass]` 而不是 `Invoke-CimMethod`:后者无法绑定 `ProcessStartupInformation`(报"类型不匹配")。
+
+**已验证**:用**真实启动器**创建一个长命进程(并确认它确实起来了、启动器 exit 0),
+前后枚举可见控制台窗口**数量不变**。用户侧 `restart-dsh-web.ps1` 的 WMI 转交有同一问题,已同样修复。
+
+遗留可见窗口:全部属于同一个 Windows Terminal 进程(pid 23444),其**子进程为空**
+(标签页里的进程都已退出),且当前 DSH 的祖先链上没有它 —— 关掉不影响 DSH。
+
+### 发现 F7 —— 重启按钮的禁用理由与实际前置条件不一致(Minor,未修)
+
+`client.js:178` 的禁用条件是 `state.autostartEnabled` 为假就禁用,但**路由的真实前置条件是
+`config.json` 存在**。于是"自启已停用、但 `config.json` 仍在"时,按钮是灰的、提示却在说
+"需要先由它生成 config.json" —— 而那个文件确实存在(本次验收收尾时正处于这个状态:卡片显示
+`开机自启: 未启用` 并要求启用,但重启其实是可用的)。建议按 `config.json` 是否存在来禁用,
+或让提示文案与真实条件一致。
+
 ## 验收后的处理(2026-09-10 当晚)
 
 | 发现 | 处理 | 证据 |
@@ -108,10 +149,11 @@ DSH 停在下线状态,需外部手段(本机 `restart-dsh-web.ps1` 或官方命
 - 插件的 **挂载层** 与 **四条写路由** 在真机 `0.1.5-rc.1` 上**全部工作**,包括它存在的理由
   (助手在宿主退出后仍然存活并拉起新实例、`accessUrl` 随新 token 刷新)。
 - 验收中发现的 **F2/F3 两个集成风险已修复并验证**;F4 为待定的 Minor。
-- **仍未验证**(只能由人用眼睛/手完成):
-  1. 「设置 → 通用设置」底部的**卡片是否出现**、内容是否正确(Step 1);
-  2. 重启瞬间**是否有控制台窗口闪烁**(M4/M6);
-  3. **从 UI 卸载插件**(M7 的 UI 路径)。
+- **三个"需人工"项的状态**:
+  1. **卡片是否出现、内容是否正确 → 已通过**(用户截图确认:标题、服务状态、访问地址、复制按钮、
+     免责声明行都在,且访问地址是当前有效 token);
+  2. **重启时无控制台窗口 → 实测失败,已修(F6),需要用户再肉眼复核一次**;
+  3. **从 UI 卸载插件(M7 的 UI 路径)→ 仍未做**;注册表层面的清理已用真实注册表验证过。
 - 因此:**"机制已验证,插件未完全验收"** —— 三条人工项完成后才能说"确保能用"。
 - 当前机器状态:插件已安装并加载(自启条目**已停用**,注册表只剩用户原有四条,避免开机竞态);
   手机远程正常。
