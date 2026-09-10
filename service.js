@@ -117,6 +117,50 @@ export async function runStart(input) {
   return { started: true, pid, up }
 }
 
+/** Whether a pid is still alive on this OS (Windows-safe). */
+export function defaultIsAlive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Poll until the pid disappears. Never a fixed sleep: a fast exit returns fast.
+ * @returns true when the process is gone, false when the deadline passed first.
+ */
+export async function waitForProcessExit(pid, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 30000
+  const intervalMs = options.intervalMs ?? 250
+  const isAlive = options.isAlive ?? defaultIsAlive
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    if (!isAlive(pid)) return true
+    if (Date.now() >= deadline) return false
+    await new Promise((resolve) => setTimeout(resolve, intervalMs))
+  }
+}
+
+/**
+ * Full restart: wait for the old process to exit, then start DSH again.
+ * Aborting (rather than starting a second instance) is the safe failure mode.
+ */
+export async function runRestart(input) {
+  const { config, oldPid, log } = input
+  const deps = input.deps ?? {}
+  const waitExit = deps.waitForProcessExit ?? waitForProcessExit
+  const exited = await waitExit(oldPid, { timeoutMs: config.waitForExitMs })
+  if (!exited) {
+    log(`WARN old process ${oldPid} still alive after ${config.waitForExitMs}ms; aborting restart`)
+    return { restarted: false }
+  }
+  log(`old process ${oldPid} exited; starting a new instance`)
+  const started = await runStart({ config, log, deps })
+  return { restarted: true, ...started }
+}
+
 /** Log to service.log, creating the directory first. */
 function makeLogger(config) {
   const target = config?.logPaths?.service
@@ -159,6 +203,16 @@ export async function main(argv, deps = {}) {
   try {
     if (mode === 'start') {
       await runStart({ config, log, deps })
+      return 0
+    }
+    if (mode === 'restart') {
+      const pidFlag = argv.indexOf('--pid')
+      const oldPid = pidFlag === -1 ? Number.NaN : Number(argv[pidFlag + 1])
+      if (!Number.isInteger(oldPid) || oldPid <= 0) {
+        log('restart requires --pid <number>')
+        return 2
+      }
+      await runRestart({ config, oldPid, log, deps })
       return 0
     }
     return 2
