@@ -2084,6 +2084,7 @@ test('restart refuses while a restart is already scheduled', async () => {
     argv: ['bin.js', 'web'],
     cwd: 'C:\\work',
     spawnHelper: () => {},
+    scheduleExit: () => {},
   })
   const first = fakeRes()
   await handlers.restart(req(), first)
@@ -2103,6 +2104,7 @@ test('restart spawns the helper with the current pid', async () => {
     cwd: 'C:\\work',
     currentPid: 4321,
     spawnHelper: (deps) => calls.push(deps),
+    scheduleExit: () => {},
   })
   const res = fakeRes()
   await handlers.restart(req(), res)
