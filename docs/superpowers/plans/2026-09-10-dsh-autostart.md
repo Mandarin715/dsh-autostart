@@ -2391,7 +2391,9 @@ test('countRunningAgents counts only running agents', () => {
   const agents = { list: () => [{ status: 'running' }, { status: 'idle' }, { status: 'running' }] }
   assert.equal(countRunningAgents(agents), 2)
   assert.equal(countRunningAgents(undefined), 0)
-  assert.equal(countRunningAgents({}), 0)
+  // 服务存在但没有 list(或 list 返回非数组)= 读不出来,按"未知"处理,
+  // 不是 0 —— 0 会静默解除用户开启的保护。
+  assert.equal(countRunningAgents({}), null)
 })
 
 test('restart refuses while a restart is already scheduled', async () => {
