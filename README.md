@@ -18,9 +18,27 @@ The software is provided "as is" (MIT License, no warranty of any kind).
 
 ## Requirements
 
-- Windows 10 / 11
+- Windows 10 / 11 (`Win32_Process.Create` must work through PowerShell — the restart helper is deliberately created by the WMI service, so that it is not killed together with the host)
 - Node.js ≥ 20 (shipped with DSH)
-- DeepSeek Harness ≥ `0.1.0-rc.6` (tested on `0.1.2-rc.1`)
+- DeepSeek Harness ≥ `0.1.0-rc.6` (tested on `0.1.2-rc.1`; the job-object behaviour the restart depends on was measured on `0.1.5-rc.1`)
+- A writable `HKCU\...\Run` for autostart — security software that blocks registry writes makes "enable" fail
+
+### Environment and restart
+
+The restart helper is created by the **WMI service**, not by DSH directly. DSH runs its
+subprocesses inside a Windows Job Object created kill-on-close, so a merely "detached" helper is
+killed the instant DSH exits — leaving DSH down. Having WMI create it is what lets it outlive the
+host.
+
+One consequence: a process created that way does **not** inherit your environment. So:
+
+- the helper is told where `config.json` lives explicitly (`--config <absolute path>`), instead of
+  re-deriving the DSH home from `DSH_HOME` (which would be missing);
+- the restart re-asserts `DSH_HOME` from the `dshHome` captured in `config.json`.
+
+Other environment variables (a custom `PATH`, extra variables DSH reads) are **not** carried over
+to the restarted instance. If your DSH setup depends on environment variables, keep that in mind,
+and prefer an absolute `command.execPath`.
 
 ## Install
 

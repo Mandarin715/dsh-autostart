@@ -55,6 +55,9 @@ export function countRunningAgents(agentsService) {
 /** How long to wait for the WMI launcher to finish creating the helper. */
 const DEFAULT_LAUNCHER_TIMEOUT_MS = 15000
 
+/** Bounded tail of the launcher's stderr kept for diagnosing a launch failure. */
+const DEFAULT_LAUNCHER_STDERR_TAIL = 2000
+
 const messageOf = (error) => (error instanceof Error ? error.message : String(error))
 
 /**
@@ -85,17 +88,32 @@ export async function defaultSpawnHelper(input, deps = {}) {
     throw new Error(`node executable not found: ${input.execPath}`)
   }
   const commandLine = buildHelperCommandLine(input)
-  const { command, args } = buildLauncherArgv(commandLine)
+  const { command, args } = buildLauncherArgv(commandLine, { env: deps.env })
   const spawnLauncher = deps.spawnLauncher ?? ((cmd, argv, options) => spawn(cmd, argv, options))
   const timeoutMs = deps.launcherTimeoutMs ?? DEFAULT_LAUNCHER_TIMEOUT_MS
+  const stderrTailMax = deps.stderrTailMax ?? DEFAULT_LAUNCHER_STDERR_TAIL
 
   await new Promise((resolve, reject) => {
     let child
     try {
-      child = spawnLauncher(command, args, { windowsHide: true, stdio: 'ignore' })
+      // stderr is piped (not ignored) so a failure can name its cause: the exit
+      // code alone is identical for WMI disabled, a missing PowerShell and
+      // access denied, and WMI is now a hard dependency of this feature.
+      child = spawnLauncher(command, args, {
+        windowsHide: true,
+        stdio: ['ignore', 'ignore', 'pipe'],
+      })
     } catch (error) {
       reject(new Error(`could not start the restart launcher: ${messageOf(error)}`))
       return
+    }
+    let stderrTail = ''
+    if (child.stderr !== undefined && child.stderr !== null) {
+      child.stderr.setEncoding?.('utf8')
+      child.stderr.on('data', (chunk) => {
+        // Bounded: a hostile or broken launcher must not grow this without limit.
+        stderrTail = (stderrTail + chunk).slice(-stderrTailMax)
+      })
     }
     let settled = false
     const finish = (settle, value) => {
@@ -103,6 +121,15 @@ export async function defaultSpawnHelper(input, deps = {}) {
       settled = true
       clearTimeout(timer)
       settle(value)
+    }
+    // The last non-empty stderr line is the actionable one (the launcher writes
+    // the WMI ReturnValue there).
+    const detail = () => {
+      const line = stderrTail
+        .split(/\r?\n/)
+        .filter((text) => text.trim() !== '')
+        .pop()
+      return line === undefined ? '' : `: ${line.trim()}`
     }
     const timer = setTimeout(() => {
       try {
@@ -116,9 +143,14 @@ export async function defaultSpawnHelper(input, deps = {}) {
     child.once('error', (error) =>
       finish(reject, new Error(`restart launcher failed: ${messageOf(error)}`)),
     )
-    child.once('exit', (code) => {
-      if (code === 0) finish(resolve)
-      else finish(reject, new Error(`the restart launcher exited with code ${code}`))
+    child.once('exit', (code, signal) => {
+      if (code === 0) {
+        finish(resolve)
+        return
+      }
+      // A killed launcher reports code null; saying "code null" would hide why.
+      const how = code === null ? `was killed by signal ${signal}` : `exited with code ${code}`
+      finish(reject, new Error(`the restart launcher ${how}${detail()}`))
     })
   })
 }
@@ -340,23 +372,34 @@ export function createHandlers(deps) {
         send(res, 409, { error: `refusing to restart: ${detail}` })
         return
       }
+      // The flag is set BEFORE the await, not after. spawnHelper is async now, so
+      // setting it afterwards would leave an interleaving point where two
+      // overlapping POSTs both pass the check above, launch two helpers, and arm
+      // two exits — which spec §7 forbids ("a restart is already scheduled").
+      restarting = true
       try {
         // Awaited on purpose: the launcher runs inside DSH's job, so it must
         // finish handing the helper to the WMI service BEFORE this host exits.
         // Fire-and-forget would let the exit kill the launcher mid-call, leaving
         // nothing behind to bring DSH back.
+        //
+        // configPath is passed explicitly rather than left to the helper: the WMI
+        // boundary drops this process's environment, so DSH_HOME would be absent
+        // and the helper would fall back to ~/.dsh and read the wrong config.
+        // Derived from the resolved dshHome, so a deps.dshHome override is honoured.
         await spawnHelper({
           execPath: deps.execPath ?? process.execPath,
           serviceJsPath: deps.serviceJsPath ?? SERVICE_JS,
-          cwd: deps.cwd ?? process.cwd(),
           oldPid: deps.currentPid ?? process.pid,
+          configPath: configFilePath(dshHome),
         })
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        send(res, 500, { error: `could not start the restart helper: ${message}` })
+        // Clear the flag so the user can retry: nothing was started, and the host
+        // is still alive to serve the next request.
+        restarting = false
+        send(res, 500, { error: `could not start the restart helper: ${messageOf(error)}` })
         return
       }
-      restarting = true
       send(res, 202, { accepted: true, runningAgents: running })
       const scheduleExit = deps.scheduleExit ?? ((fn, ms) => setTimeout(fn, ms))
       scheduleExit(() => process.exit(0), pluginConfig.exitDelayMs)

@@ -23,8 +23,23 @@ export function readConfig(configPath) {
   return parseConfigFile(text)
 }
 
+/**
+ * Environment for the replacement DSH instance.
+ *
+ * The helper is created by the WMI service, which does NOT pass on the caller's
+ * environment, so the replacement would otherwise start without DSH_HOME and —
+ * for anyone using a non-default home — against the wrong one. The home captured
+ * at enable time (config.json) is re-asserted here. When nothing was captured the
+ * base environment is returned untouched, so an older config keeps working.
+ */
+export function dshEnv(config, base = process.env) {
+  const home = config?.dshHome
+  if (typeof home !== 'string' || home === '') return base
+  return { ...base, DSH_HOME: home }
+}
+
 /** Launch DSH detached, with stdout/stderr appended to the log files. */
-export function spawnDsh(config, log = () => {}) {
+export function spawnDsh(config, log = () => {}, deps = {}) {
   // parseConfigFile does not validate logPaths (it cannot — it never receives
   // dshHome), so guard it here: an unguarded openSync would throw a TypeError
   // that escapes main's contract of returning an exit code.
@@ -33,11 +48,13 @@ export function spawnDsh(config, log = () => {}) {
   }
   const out = fs.openSync(config.logPaths.out, 'a')
   const err = fs.openSync(config.logPaths.err, 'a')
-  const child = spawn(config.command.execPath, config.command.argv, {
+  const spawnImpl = deps.spawn ?? spawn
+  const child = spawnImpl(config.command.execPath, config.command.argv, {
     cwd: config.command.cwd,
     detached: true,
     windowsHide: true,
     stdio: ['ignore', out, err],
+    env: dshEnv(config, deps.baseEnv ?? process.env),
   })
   // A bad execPath emits 'error'; with no listener Node rethrows it as an
   // uncaught exception, killing this hidden login helper before it can report
@@ -134,7 +151,7 @@ export async function runStart(input) {
     log(`port ${config.dshPort} already running; skip start`)
     return { started: false }
   }
-  const pid = spawnImpl(config, log)
+  const pid = spawnImpl(config, log, deps)
   log(`spawned dsh pid=${pid}`)
   const up = await wait(config.dshPort, { timeoutMs: config.startTimeoutMs })
   log(up ? `port ${config.dshPort} is up` : `WARN port ${config.dshPort} did not come up in time`)
@@ -210,7 +227,17 @@ function makeLogger(config) {
  */
 export async function main(argv, deps = {}) {
   const mode = argv[2]
-  const configPath = deps.configPath ?? configFilePath(resolveDshHome())
+  // An explicit --config is how the restart helper is told where config.json is:
+  // WMI creates it with the provider host's environment, so DSH_HOME is absent
+  // and resolveDshHome() would point at the wrong home entirely.
+  const configFlag = argv.indexOf('--config')
+  const named = configFlag === -1 ? null : argv[configFlag + 1]
+  if (configFlag !== -1 && (typeof named !== 'string' || named === '')) {
+    // Present but unusable. Falling back silently would reintroduce exactly the
+    // wrong-home failure this flag exists to prevent, so refuse instead.
+    return 2
+  }
+  const configPath = deps.configPath ?? named ?? configFilePath(resolveDshHome())
   let config
   try {
     config = readConfig(configPath)

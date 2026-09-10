@@ -225,3 +225,94 @@ test('main writes service.log NEXT TO the config file when the config cannot be 
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('main reads the config named by --config, never a re-derived DSH home', async () => {
+  // WMI creates the helper with the provider host's environment, so DSH_HOME is
+  // absent there. If the helper re-derived the home it would read a different
+  // config.json, exit 1, and leave DSH down — the defect this flag removes.
+  // DSH_HOME is pointed at a temp dir so that even the fallback path cannot
+  // touch the real ~/.dsh while this is red.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-cfg-'))
+  const home = path.join(dir, 'home')
+  const named = path.join(dir, 'named', 'config.json')
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const code = await main(['node', 'service.js', 'start', '--config', named], {})
+    assert.equal(code, 1)
+    assert.equal(
+      fs.existsSync(path.join(dir, 'named', 'service.log')),
+      true,
+      'the failure log must land next to the --config path (proof it was used)',
+    )
+    assert.equal(
+      fs.existsSync(path.join(home, 'dsh-autostart', 'service.log')),
+      false,
+      'the helper must not fall back to DSH_HOME',
+    )
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('spawnDsh re-asserts the DSH_HOME captured at enable time', () => {
+  // The replacement instance is created by the helper, which inherited the WMI
+  // host's environment — so without re-asserting it, a custom-DSH_HOME user's
+  // restarted DSH would come up against the wrong home.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-spawn-'))
+  try {
+    let captured = null
+    const config = baseConfig({
+      dshHome: 'C:\\custom home',
+      command: { execPath: process.execPath, argv: ['-e', '0'], cwd: dir },
+      logPaths: {
+        out: path.join(dir, 'out.log'),
+        err: path.join(dir, 'err.log'),
+        service: path.join(dir, 'service.log'),
+      },
+    })
+    spawnDsh(config, () => {}, {
+      baseEnv: { PATH: 'C:\\WINDOWS' },
+      spawn: (command, args, options) => {
+        captured = { command, args, options }
+        return { once() {}, unref() {} }
+      },
+    })
+    assert.equal(captured.options.env.DSH_HOME, 'C:\\custom home')
+    assert.equal(captured.options.env.PATH, 'C:\\WINDOWS', 'the rest of the environment is preserved')
+    // Still launched detached and windowless: unchanged by this fix.
+    assert.equal(captured.options.detached, true)
+    assert.equal(captured.options.windowsHide, true)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('spawnDsh leaves the environment alone when no dshHome was captured', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-spawn2-'))
+  try {
+    let captured = null
+    const baseEnv = { PATH: 'C:\\WINDOWS' }
+    const config = baseConfig({
+      command: { execPath: process.execPath, argv: ['-e', '0'], cwd: dir },
+      logPaths: {
+        out: path.join(dir, 'out.log'),
+        err: path.join(dir, 'err.log'),
+        service: path.join(dir, 'service.log'),
+      },
+    })
+    spawnDsh(config, () => {}, {
+      baseEnv,
+      spawn: (command, args, options) => {
+        captured = { command, args, options }
+        return { once() {}, unref() {} }
+      },
+    })
+    assert.equal(captured.options.env, baseEnv, 'an absent dshHome must not invent one')
+    assert.equal('DSH_HOME' in captured.options.env, false)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

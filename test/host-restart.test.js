@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { createHandlers, countRunningAgents, defaultSpawnHelper } from '../index.js'
 
 function fakeRes() {
@@ -214,9 +215,12 @@ test('restart refuses when the agents service is absent and the gate is on', asy
 })
 
 /** A ChildProcess stand-in that records the listeners defaultSpawnHelper attaches. */
-function fakeLauncher({ exitCode = 0, hang = false } = {}) {
+function fakeLauncher({ exitCode = 0, signal = null, hang = false, stderrText = null } = {}) {
   const handlers = {}
+  const stderr = new EventEmitter()
+  stderr.setEncoding = () => {}
   const child = {
+    stderr,
     once(event, cb) {
       handlers[event] = cb
       return child
@@ -225,18 +229,19 @@ function fakeLauncher({ exitCode = 0, hang = false } = {}) {
   }
   // Fire only after the caller has had a chance to attach its listeners.
   setImmediate(() => {
-    if (!hang && handlers.exit) handlers.exit(exitCode)
+    if (stderrText !== null) stderr.emit('data', stderrText)
+    if (!hang && handlers.exit) handlers.exit(exitCode, signal)
   })
   return child
 }
 
-/** Launch input whose two paths really exist, so the guard does not short-circuit. */
+/** Launch input whose paths really exist, so the guard does not short-circuit. */
 function spawnInput(overrides = {}) {
   return {
     execPath: process.execPath,
     serviceJsPath: import.meta.filename,
-    cwd: '.',
     oldPid: 99,
+    configPath: 'C:\\dsh\\dsh-autostart\\config.json',
     ...overrides,
   }
 }
@@ -280,20 +285,68 @@ test('defaultSpawnHelper launches the helper through the WMI service', async () 
       return fakeLauncher()
     },
   })
-  assert.equal(captured.command, 'powershell.exe')
-  assert.equal(captured.options.stdio, 'ignore')
+  // Absolute, not a bare 'powershell.exe': CreateProcess searches the current
+  // directory first, so a planted executable would win.
+  assert.match(captured.command, /powershell\.exe$/i)
+  assert.match(captured.command, /^[A-Za-z]:\\/)
+  // stderr is piped so a failure can name its cause.
+  assert.deepEqual(captured.options.stdio, ['ignore', 'ignore', 'pipe'])
   const script = Buffer.from(
     captured.args[captured.args.indexOf('-EncodedCommand') + 1],
     'base64',
   ).toString('utf16le')
   assert.match(script, /Win32_Process/)
   assert.match(script, /restart --pid 99/)
+  // The helper must be told where config.json is: the WMI boundary drops the
+  // caller's environment, so it cannot be allowed to re-derive DSH_HOME.
+  assert.match(script, /--config/)
+  assert.match(script, /config\.json/)
 })
 
 test('defaultSpawnHelper rejects when the launcher exits non-zero', async () => {
   await assert.rejects(
     () => defaultSpawnHelper(spawnInput(), { spawnLauncher: () => fakeLauncher({ exitCode: 1 }) }),
     /code 1/,
+  )
+})
+
+test('defaultSpawnHelper names the cause when the launcher fails', async () => {
+  // Without this the user sees the same "code 1" for WMI disabled, a missing
+  // PowerShell and access denied — WMI is now a hard dependency of restart.
+  await assert.rejects(
+    () =>
+      defaultSpawnHelper(spawnInput(), {
+        spawnLauncher: () =>
+          fakeLauncher({
+            exitCode: 1,
+            stderrText: 'junk line\nWin32_Process.Create failed, ReturnValue=9\n',
+          }),
+      }),
+    /ReturnValue=9/,
+  )
+})
+
+test('defaultSpawnHelper reports a killed launcher instead of "code null"', async () => {
+  await assert.rejects(
+    () =>
+      defaultSpawnHelper(spawnInput(), {
+        spawnLauncher: () => fakeLauncher({ exitCode: null, signal: 'SIGTERM' }),
+      }),
+    /killed by signal SIGTERM/,
+  )
+})
+
+test('defaultSpawnHelper rejects when the launcher cannot even be started', async () => {
+  // spawnLauncher throws synchronously (EPERM/ENOENT from the OS): that must
+  // become a rejection the route can answer, not an unhandled throw.
+  await assert.rejects(
+    () =>
+      defaultSpawnHelper(spawnInput(), {
+        spawnLauncher: () => {
+          throw new Error('EPERM: operation not permitted')
+        },
+      }),
+    /could not start the restart launcher.*EPERM/,
   )
 })
 
@@ -308,6 +361,79 @@ test('defaultSpawnHelper rejects when the launcher never finishes', async () => 
       }),
     /did not finish/,
   )
+})
+
+test('restart passes the host-resolved config path to the helper', async () => {
+  // Derived from the resolved dshHome (which deps can override), never from
+  // DSH_HOME — the helper is created across a boundary that drops the env.
+  let seen = null
+  const handlers = createHandlers(
+    restartDeps({
+      dshHome: 'C:\\custom home',
+      spawnHelper: (input) => {
+        seen = input
+      },
+      scheduleExit: () => {},
+    }),
+  )
+  const res = fakeRes()
+  await handlers.restart(req(), res)
+  assert.equal(res.statusCode, 202)
+  assert.equal(seen.configPath, 'C:\\custom home\\dsh-autostart\\config.json')
+})
+
+test('two overlapping restarts launch exactly one helper', async () => {
+  // The re-entrancy flag has to be set BEFORE the await: spawnHelper is async
+  // now, so setting it afterwards leaves an interleaving point where both
+  // requests pass the check, two helpers launch and two exits are armed — which
+  // spec §7 forbids, and which lets two DSH instances race for the port.
+  let launches = 0
+  let exits = 0
+  let release
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
+  const handlers = createHandlers(
+    restartDeps({
+      spawnHelper: async () => {
+        launches += 1
+        await gate
+      },
+      scheduleExit: () => {
+        exits += 1
+      },
+    }),
+  )
+  const first = fakeRes()
+  const second = fakeRes()
+  const firstCall = handlers.restart(req(), first)
+  // The second request arrives while the first is still awaiting the launch.
+  const secondCall = handlers.restart(req(), second)
+  release()
+  await Promise.all([firstCall, secondCall])
+  assert.equal(first.statusCode, 202)
+  assert.equal(second.statusCode, 409)
+  assert.equal(launches, 1, 'only one helper may be launched')
+  assert.equal(exits, 1, 'only one exit may be armed')
+})
+
+test('a failed launch clears the re-entrancy flag so the user can retry', async () => {
+  let attempts = 0
+  const handlers = createHandlers(
+    restartDeps({
+      spawnHelper: async () => {
+        attempts += 1
+        if (attempts === 1) throw new Error('first launch fails')
+      },
+      scheduleExit: () => {},
+    }),
+  )
+  const first = fakeRes()
+  await handlers.restart(req(), first)
+  assert.equal(first.statusCode, 500)
+  const second = fakeRes()
+  await handlers.restart(req(), second)
+  assert.equal(second.statusCode, 202, 'a failed launch must not lock the button forever')
 })
 
 test('restart arms the exit only after the helper launch has completed', async () => {

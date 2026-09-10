@@ -6,6 +6,8 @@
 
 **Architecture:** 插件由两个部件构成 —— (1) 插件本体(`index.js` host 侧 + `client.js` 浏览器侧)负责状态聚合、注册表读写、生成 `config.json`/`bootstrap.vbs`、以及重启调度;(2) 独立 Node 助手 `service.js` 负责真正启动/重启 DSH(因为宿主调用 `process.exit(0)` 后自身无法继续)。所有等待一律用**条件轮询**,不用固定 sleep;所有进程一律 **detached**,不依赖宿主进程树。
 
+> ⚠️ **已被 spec §3.2 取代(superseded)**:本计划下文关于"助手用 `spawn(..., { detached: true })` 启动即可脱离宿主"的说法**是错的**,已于 2026-09-10 在真机上证伪。DSH 的子进程位于一个 kill-on-close 的 Windows Job Object 中,`detached` 并不设置 `CREATE_BREAKAWAY_FROM_JOB`,因此助手会被宿主一起杀掉、DSH 停摆。请以 **spec §3.2 / §3.2.1** 为准:助手经 **WMI**(`Win32_Process.Create`)在 Job 之外创建,启动必须 `await`,失败不得退出宿主,且 `--config` 显式传路径、`DSH_HOME` 由 config.json 的 `dshHome` 重新断言。
+
 **Tech Stack:** Node.js ≥ 20(ESM,零运行时依赖)· `node:test` 做测试 · DSH Cordis 插件机制(`ctx.webServer.register` + `ctx.slots.register`)· Windows `reg.exe` 读写注册表 · `wscript.exe` 无窗口启动
 
 **Spec:** `docs/superpowers/specs/2026-09-10-dsh-autostart-design.md`

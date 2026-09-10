@@ -18,9 +18,25 @@ Windows 专用的 DeepSeek Harness 插件:在设置页一键启用「开机自�
 
 ## 要求
 
-- Windows 10 / 11
+- Windows 10 / 11(需要能通过 PowerShell 调用 `Win32_Process.Create` —— 重启助手**刻意**交由 WMI 服务创建,以免和宿主一起被杀)
 - Node.js ≥ 20(随 DSH 提供)
-- DeepSeek Harness ≥ `0.1.0-rc.6`(实测于 `0.1.2-rc.1`)
+- DeepSeek Harness ≥ `0.1.0-rc.6`(实测于 `0.1.2-rc.1`;重启所依赖的 Job Object 行为实测于 `0.1.5-rc.1`)
+- `HKCU\...\Run` 可写(开机自启用);安全软件拦截注册表会导致「启用」失败
+
+### 环境与重启
+
+重启助手是由 **WMI 服务**创建的,不是 DSH 直接创建的。DSH 把自己的子进程放在一个
+kill-on-close 的 Windows Job Object 里,所以仅仅 `detached` 的助手会在 DSH 退出的瞬间被
+一起杀掉 —— 结果是 DSH 停摆、再也起不来。交给 WMI 创建,它才能活得比宿主久。
+
+代价是:这样创建出来的进程**不继承你的环境变量**。因此:
+
+- 助手的 config.json 路径由宿主用 `--config <绝对路径>` 显式告知(而不是让助手去按
+  `DSH_HOME` 推导 —— 那个变量在这里是缺失的);
+- 重启时用 config.json 里记录的 `dshHome` 重新断言 `DSH_HOME`。
+
+其余环境变量(自定义 `PATH`、DSH 读取的其他变量)**不会**被带到重启后的实例。如果你的
+DSH 配置依赖环境变量,请留意这一点,并尽量让 `command.execPath` 是绝对路径。
 
 ## 安装
 

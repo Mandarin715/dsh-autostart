@@ -73,6 +73,22 @@ test('parseConfigFile restores defaults for fields missing from an older file', 
   assert.equal(parsed.startTimeoutMs, PLUGIN_DEFAULTS.startTimeoutMs)
   assert.equal(parsed.hookScript, '')
   assert.equal(parsed.command.execPath, 'node.exe')
+  // An older file predates the captured home: null means "do not touch the
+  // environment", which is the only safe reading for a file that never had one.
+  assert.equal(parsed.dshHome, null)
+})
+
+test('the config file carries the dshHome so a restart can re-assert it', () => {
+  // The replacement DSH is launched by a helper created across the WMI boundary,
+  // which does not inherit the user's environment. Recording the home in the
+  // declared contract (§3.3) is how the restarted instance finds the same one.
+  const file = buildConfigFile({
+    command: { execPath: 'node.exe', argv: ['bin.js', 'web'], cwd: 'C:\\work' },
+    pluginConfig: resolvePluginConfig({}),
+    dshHome: 'D:\\custom\\.dsh',
+  })
+  assert.equal(file.dshHome, 'D:\\custom\\.dsh')
+  assert.equal(parseConfigFile(JSON.stringify(file)).dshHome, 'D:\\custom\\.dsh')
 })
 
 test('parseConfigFile rejects malformed input', () => {
