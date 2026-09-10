@@ -1562,7 +1562,7 @@ git commit -m "feat: add service.js start mode with hook support"
 ```js
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { waitForProcessExit, runRestart, main } from '../service.js'
+import { waitForProcessExit, runRestart, defaultIsAlive, main } from '../service.js'
 
 function baseConfig(overrides = {}) {
   return {
@@ -1653,6 +1653,26 @@ test('main rejects restart without a --pid', async () => {
   })
   assert.equal(code, 2)
 })
+
+test('defaultIsAlive treats only ESRCH as gone', () => {
+  // All three killers are injected, so this test probes no real process.
+  const alive = () => {}
+  const esrch = () => {
+    const error = new Error('no such process')
+    error.code = 'ESRCH'
+    throw error
+  }
+  const eperm = () => {
+    const error = new Error('operation not permitted')
+    error.code = 'EPERM'
+    throw error
+  }
+  assert.equal(defaultIsAlive(1, alive), true)
+  assert.equal(defaultIsAlive(1, esrch), false)
+  // EPERM means the process exists but may not be signalled: reporting it as
+  // gone would skip the abort and could start a second instance.
+  assert.equal(defaultIsAlive(1, eperm), true)
+})
 ```
 
 `test/fixtures/config.json` 已由 Task 8 创建,本任务直接复用(不要重复创建;若它不存在,说明 Task 8 未完成)。
@@ -1667,13 +1687,21 @@ Expected: FAIL —— `waitForProcessExit` / `runRestart` 未导出
 在 `service.js` 中,`runStart` 之后插入:
 
 ```js
-/** Whether a pid is still alive on this OS (Windows-safe). */
-export function defaultIsAlive(pid) {
+/**
+ * Whether a pid is still alive on this OS.
+ *
+ * Only ESRCH means "gone". Any other error — notably EPERM, for a live process
+ * this user may not signal — must report ALIVE: a false "gone" would skip
+ * runRestart's abort and spawn a second instance while the old one may still
+ * hold the port, which is the exact failure mode this path exists to avoid.
+ * The `kill` seam exists so this is testable without touching a real process.
+ */
+export function defaultIsAlive(pid, kill = (target, signal) => process.kill(target, signal)) {
   try {
-    process.kill(pid, 0)
+    kill(pid, 0)
     return true
-  } catch {
-    return false
+  } catch (error) {
+    return error?.code !== 'ESRCH'
   }
 }
 
@@ -1741,7 +1769,7 @@ export async function runRestart(input) {
 - [ ] **Step 4: 跑测试,确认通过**
 
 Run: `node --test test/service-restart.test.js`
-Expected: PASS(5 tests)
+Expected: PASS(6 tests)(5 个原始用例 + 修复轮新增的 defaultIsAlive 用例)
 
 - [ ] **Step 5: 跑全部测试确认无回归**
 
