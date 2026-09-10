@@ -56,6 +56,8 @@ dsh plugin --profile web add github:Mandarin715/dsh-autostart
 | 重启服务 | 二次确认后重启;DSH 会在数秒内恢复 |
 | 钩子脚本 | 可选。服务起来后会执行它,用于拉起你自己的依赖进程 |
 
+> **页面完全打不开?** 这张卡片只在 DSH 运行时才存在 —— 见下面的「服务没起来时怎么救」。
+
 ## 配置
 
 在 profile 的 `cordis.patch.yml` 里:
@@ -105,6 +107,74 @@ dsh plugin --profile web add github:Mandarin715/dsh-autostart
 ├── dsh-web-server.err.log
 └── service.log               # 助手日志,排查问题先看这里
 ```
+
+## 服务没起来时怎么救
+
+**卡片在 DSH 的页面里 —— DSH 没起来时你打不开卡片**,所以补救必须走命令行。按下面顺序来。
+
+### 1) 先看日志找原因
+
+```
+~/.dsh/dsh-autostart/service.log            # 助手日志:先看这个
+~/.dsh/dsh-autostart/dsh-web-server.err.log # DSH 自己的报错
+```
+
+常见三类:
+
+- `WARN port 3080 did not come up in time` → DSH 被拉起了但没监听,去看 `dsh-web-server.err.log`
+- `hook not found:` / `hook exited code=…` → 钩子问题,**不会**阻断 DSH 启动
+- `cannot read config` → `config.json` 缺失或损坏
+
+### 2) 通用补救:手动执行一次「开机入口」
+
+这一步等价于**"现在立刻跑一次开机自启"**,幂等(端口已在监听就跳过),而且**无窗口**:
+
+```powershell
+wscript.exe "$env:USERPROFILE\.dsh\dsh-autostart\bootstrap.vbs"
+```
+
+它执行 `<node> <service.js> start --config <config.json>`,把 DSH 隐藏拉起,并把 DSH 的 stdout
+写进 `~/.dsh/dsh-autostart/dsh-web-server.log` —— 成功的话那里面就会出现新的带 token 地址。
+
+### 3) 如果连 `config.json` 都不存在
+
+说明从未点过「启用自启」。那就先用你平时的方式把 DSH 起来,再到设置页启用一次自启。
+
+### 4) 用你自己惯用的启动脚本也行 —— 但只有两个要点
+
+要点是**隐藏/后台启动**,以及**不要拿控制台窗口当服务的宿主**:
+
+- ✅ `Start-Process … -WindowStyle Hidden`,或 `wscript` 跑 VBS,把 DSH 拉成后台进程
+- ❌ **不要**用 `npx @deepseek-ai/dsh web` 这种**前台占用控制台**的方式;更**不要**"先拿到带 token 的地址,
+  再把那个窗口关掉" —— 那个窗口就是 DSH 的控制台,**关掉窗口 Windows 会终止 DSH**,链接随之失效
+  (此时是"拒绝连接"而不是 401,再粘也没用)
+
+> 作者自己的机器上这一步是 `~/.dsh/scripts/start-dsh-web.ps1`(它用 `Start-Process -WindowStyle Hidden`
+> 启动,并把 stdout 写进 `~/.dsh/logs/dsh-web-server.log`)。**这是作者本地的脚本,不属于本插件**;
+> 你换成自己的等价脚本即可,或者直接用上面第 2) 步。
+
+### 5) 别把两种情况搞混
+
+| 现象 | 含义 | 做法 |
+|---|---|---|
+| 页面 **401 Unauthorized** | 服务**在跑**,只是这个浏览器没有会话 | 用「访问地址」里那条带 token 的链接进一次,**不要**重启服务 |
+| **无法访问此网站 / 拒绝了连接** | 服务**没起来** | 按上面 1)–4) 处理 |
+
+关于那条带 token 的地址,三个事实:①**只对本机有效**(它是 `127.0.0.1`;手机走域名 + 密码,由反代代换);
+②换来的会话 cookie 有 **30 天**有效期,关浏览器、重启 DSH 都不受影响;③但 **token 本身每个 DSH 进程一个,
+重启即作废** —— 所以要用**当前**这条(卡片显示的就是最新的),收藏一条长期用是无效的。
+
+### 6) 补救成功的判据
+
+- 端口 3080 处于 LISTENING
+- `service.log` 里出现 `port 3080 is up`
+- 设置页卡片的「服务」显示**运行中**
+
+### 7) 如果最近升级或迁移过 DSH
+
+`config.json` 记录的是**当时的绝对路径**(可能含 npx 缓存目录的哈希路径,如
+`…\_npx\<hash>\node_modules\@deepseek-ai\dsh\lib\bin.js`)。升级/迁移后该路径可能已失效,于是
+**自启会静默失败**(开机什么都没发生)。回设置页**重新点一次「启用自启」**让它重新捕获当前命令即可。
 
 ## 卸载
 

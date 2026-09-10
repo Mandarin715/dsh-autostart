@@ -58,6 +58,9 @@ Restart DSH, then open Settings → General and scroll to the bottom to find thi
 | Restart service | Restarts after a confirmation; DSH is back within seconds |
 | Hook script | Optional. Run once the service is up, to start your own dependent processes |
 
+> **Cannot open the page at all?** This card only exists while DSH is running — see
+> [If the service will not start](#if-the-service-will-not-start-recovery) below.
+
 ## Configuration
 
 In the profile's `cordis.patch.yml`:
@@ -109,6 +112,78 @@ Loopback keeps the strict port check.
 ├── dsh-web-server.err.log
 └── service.log               # helper log; look here first when debugging
 ```
+
+## If the service will not start (recovery)
+
+**The card lives inside DSH's page — so when DSH is down you cannot open the card.** Recovery therefore has to be
+command-line. Work down this list.
+
+### 1) Read the logs first
+
+```
+~/.dsh/dsh-autostart/service.log            # the helper's log: start here
+~/.dsh/dsh-autostart/dsh-web-server.err.log # DSH's own errors
+```
+
+Three common shapes:
+
+- `WARN port 3080 did not come up in time` → DSH was launched but never listened; look at `dsh-web-server.err.log`
+- `hook not found:` / `hook exited code=…` → a hook problem; it does **not** block DSH
+- `cannot read config` → `config.json` is missing or corrupt
+
+### 2) The general fix: run the boot entry point once by hand
+
+This is exactly "run boot autostart right now". It is idempotent (it skips when the port is already listening) and it
+opens no window:
+
+```powershell
+wscript.exe "$env:USERPROFILE\.dsh\dsh-autostart\bootstrap.vbs"
+```
+
+It runs `<node> <service.js> start --config <config.json>`, starts DSH hidden, and writes DSH's stdout to
+`~/.dsh/dsh-autostart/dsh-web-server.log` — on success a fresh token URL appears there.
+
+### 3) If `config.json` does not exist at all
+
+Autostart was never enabled. Start DSH the way you normally do, then enable autostart in the settings page.
+
+### 4) Your own launcher script works too — with two rules
+
+The rules are **start it hidden / in the background**, and **never let a console window be the service's host**:
+
+- ✅ `Start-Process … -WindowStyle Hidden`, or a `wscript` VBS, so DSH becomes a background process
+- ❌ **Do not** use a foreground console launch such as `npx @deepseek-ai/dsh web`; and **never** "grab the tokenised
+  address, then close that window" — the window *is* DSH's console, and **closing it makes Windows terminate DSH**,
+  which kills the link too. You then get "connection refused" rather than 401, and pasting it again will not help.
+
+> On the author's machine this step is `~/.dsh/scripts/start-dsh-web.ps1` (it launches with
+> `Start-Process -WindowStyle Hidden` and captures stdout into `~/.dsh/logs/dsh-web-server.log`).
+> **That is the author's local script, not part of this plugin** — substitute your own equivalent, or just use step 2.
+
+### 5) Do not confuse the two failure modes
+
+| What you see | What it means | What to do |
+|---|---|---|
+| **401 Unauthorized** | the service **is running**; this browser just has no session | open the tokenised address from "access URL" once; do **not** restart |
+| **This site can't be reached / connection refused** | the service **is not running** | work through 1)–4) above |
+
+Three facts about that tokenised address: (1) it is **local-only** (`127.0.0.1`; the phone uses the domain plus the
+password, and the reverse proxy exchanges the token for you); (2) the session cookie it grants lasts **30 days** and
+survives closing the browser and restarting DSH; (3) but the **token itself is per DSH process** and dies on every
+restart — so use the *current* one (the card always shows the latest); bookmarking one for later does not work.
+
+### 6) How you know recovery worked
+
+- port 3080 is LISTENING
+- `service.log` contains `port 3080 is up`
+- the card's "service" line says **running**
+
+### 7) If you recently upgraded or moved DSH
+
+`config.json` stores an **absolute path captured at the time** (it may contain an npx cache hash directory such as
+`…\_npx\<hash>\node_modules\@deepseek-ai\dsh\lib\bin.js`). After an upgrade or a move that path can go stale, and
+**autostart then fails silently** (nothing happens at login). Open the settings card and **click Enable again** so the
+current command is captured.
 
 ## Uninstall
 
