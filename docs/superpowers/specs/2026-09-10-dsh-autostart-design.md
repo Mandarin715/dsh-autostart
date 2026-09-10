@@ -244,7 +244,9 @@ dsh-autostart/
       6. 等 exitDelayMs(默认 800ms)→ process.exit(0)
   → service.js restart:
       1. 读 config.json
-      2. 轮询等旧 pid 消失(process.kill(pid, 0)),上限 waitForExitMs(30s)
+      2. 轮询等旧 pid 消失(`process.kill(pid, 0)`),上限 waitForExitMs(30s)
+   —— 存活判定**只有 ESRCH 视为"已消失"**;`EPERM` 等其他错误一律视为**仍存活**。
+   若把所有错误都当"已消失",会跳过下面的中止分支而启动第二个实例,与"宁可不动也不制造双实例"的安全方向相反。
       3. 用 config.command 启动 DSH:detached,stdout→out 日志,stderr→err 日志
       4. 轮询等端口 LISTENING,上限 30s(条件轮询,无固定 sleep)
       5. 若 hookScript 非空且存在 → 执行钩子,记录其退出码
