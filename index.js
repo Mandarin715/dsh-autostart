@@ -35,16 +35,41 @@ function defaultSpawnHelper() {
   throw new Error('restart is not implemented yet')
 }
 
-/** Only same-origin writes are accepted: these endpoints can restart the host. */
-export function sameOrigin(headers) {
+/**
+ * Loopback hostnames the DSH web server is legitimately reachable at.
+ * A request whose Host is anything else is not addressed to this machine's own
+ * loopback service, regardless of what its Origin claims.
+ */
+export const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
+
+/**
+ * Whether a write request comes from this service's own page.
+ *
+ * Comparing `Origin` with `Host` alone proves nothing: both headers come from
+ * the caller, and under DNS rebinding they agree by construction — a page
+ * served from evil.example:<port> whose domain then rebinds to 127.0.0.1:<port>
+ * presents `Host: evil.example:<port>` with a matching Origin. So require the
+ * Host itself to be a loopback authority, and the port to be the one this
+ * plugin actually serves, before comparing the two.
+ *
+ * @param expectedPort - the plugin's configured dshPort; when given, the Host
+ *   must name exactly it.
+ */
+export function sameOrigin(headers, expectedPort) {
   const host = headers?.host
   const origin = headers?.origin
   if (typeof host !== 'string' || typeof origin !== 'string') return false
+  let hostUrl
+  let originUrl
   try {
-    return new URL(origin).host === host
+    hostUrl = new URL(`http://${host}`)
+    originUrl = new URL(origin)
   } catch {
     return false
   }
+  if (!LOOPBACK_HOSTNAMES.has(hostUrl.hostname)) return false
+  if (Number.isInteger(expectedPort) && hostUrl.port !== String(expectedPort)) return false
+  return originUrl.host === hostUrl.host
 }
 
 /** Read the newest access URL out of the captured stdout, if any. */
@@ -104,7 +129,7 @@ export function createHandlers(deps) {
       send(res, 400, { error: unsupportedReason(platform) })
       return false
     }
-    if (!sameOrigin(req.headers)) {
+    if (!sameOrigin(req.headers, pluginConfig.dshPort)) {
       send(res, 403, { error: 'same-origin request required' })
       return false
     }
