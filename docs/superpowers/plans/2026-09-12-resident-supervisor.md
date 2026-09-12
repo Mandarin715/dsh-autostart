@@ -61,16 +61,30 @@
 
 ```js
 // Stand-in for the supervisor: stay alive, and spawn an attached long-lived child.
-// ASCII only is not required for .js (Node reads UTF-8), but keep it simple.
 const { spawn } = require('node:child_process')
+const fs = require('node:fs')
+
+const lifetimeMs = Number(process.argv[2] ?? 300000)
+const pidFile = process.argv[3] ?? 'spike-console-inherit.pid'
 
 const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
   detached: false,      // the proposed change: inherit this process's console
   windowsHide: false,   // and do NOT pass CREATE_NO_WINDOW
   stdio: ['ignore', 'ignore', 'ignore'],
 })
-process.stdout.write(`child=${child.pid} self=${process.pid}\n`)
-setTimeout(() => process.exit(0), Number(process.argv[2] ?? 300000))
+// Write the pids to a FILE, and only when the spawn really produced a pid.
+// Do NOT rely on stdout passthrough: a launcher that collects our stdout with
+// `| Out-String` buffers until we exit, so the reader would see nothing for the whole
+// lifetime. Do NOT make the reader find us by matching process command lines either --
+// that literal can land in the reader's own command line (this project has killed its
+// own tool runner exactly that way).
+child.once('error', (error) => {
+  fs.writeFileSync(pidFile, `error=${error.message}\n`)
+  process.exit(1)
+})
+fs.writeFileSync(pidFile, `child=${child.pid} self=${process.pid}\n`)
+process.stdout.write(`child=${child.pid} self=${process.pid}\n`) // for log readability only
+setTimeout(() => process.exit(0), lifetimeMs)
 ```
 
 - [ ] **Step 2: 写启动器(经 wscript 拿到隐藏控制台,与登录入口同形)**
@@ -80,12 +94,20 @@ setTimeout(() => process.exit(0), Number(process.argv[2] ?? 300000))
 ```powershell
 # Mirrors the login entry shape: wscript -> powershell -> node (attached child).
 # ASCII only: PowerShell 5.1 reads a BOM-less .ps1 as ANSI.
-$log = Join-Path $env:USERPROFILE '.dsh\logs\spike-console-inherit.log'
+param(
+    [int]$LifetimeMs = 300000,
+    [string]$LogPath = (Join-Path $env:USERPROFILE '.dsh\logs\spike-console-inherit.log'),
+    [string]$PidPath = (Join-Path $env:USERPROFILE '.dsh\logs\spike-console-inherit.pid')
+)
 $node = (Get-Command node).Source
 $js = Join-Path $PSScriptRoot 'spike-console-inherit-spawn.js'
-"=== spike start $(Get-Date -Format o) ===" | Out-File -FilePath $log -Append -Encoding utf8
-$out = (& $node $js 300000 2>&1 | Out-String).Trim()
-"$out" | Out-File -FilePath $log -Append -Encoding utf8
+Remove-Item -Path $PidPath -ErrorAction SilentlyContinue
+"=== spike start $(Get-Date -Format o) ===" | Out-File -FilePath $LogPath -Append -Encoding utf8
+# Stream node's output PER LINE. Never collect it with `| Out-String`: that buffers until
+# node exits, so the pid line would only appear at t+LifetimeMs -- which is what produced a
+# false FAIL in the first run of this task (see the note under Step 3).
+& $node $js $LifetimeMs $PidPath 2>&1 |
+    ForEach-Object { Add-Content -Path $LogPath -Value $_ -Encoding utf8 }
 ```
 
 - [ ] **Step 3: 用 wscript 拉起它(复刻 `bootstrap.vbs` 的隐藏窗口语义)**
@@ -104,11 +126,16 @@ Get-Content "$env:USERPROFILE\.dsh\logs\spike-console-inherit.log" -Encoding UTF
 
 Expected: 进程树里出现 `powershell`(spawner)+ 一个 attached 的 `node`(子进程),而**控制台窗口不可见**。
 
-> ⚠️ **实测修正(2026-09-12)**:**不要**等日志里出现 `child=<pid> self=<pid>` 才开始 Step 5。
-> 启动器那行 `(& $node $js … | Out-String)` 会**缓冲到 node 进程退出**(本例 300 秒),所以
-> `child=` 要到 t≈300s 才落盘。照 Step 5 原本的写法从日志正则取 pid 会得到 `child=0`,
-> 于是 10 行全是 `DEAD` —— 一个**假 FAIL**。pid 从**进程树**取(见 Step 5),日志那行等它
-> 出现后再用于**交叉校验**。
+> ⚠️ **实测修正(2026-09-12)——这一版启动器是修过的,别退回旧写法。**
+> 第一版用 `(& $node $js … | Out-String)` 收集 node 输出。那个管道**缓冲到 node 进程退出**,
+> 于是 `child=` 要到 t≈300s 才落盘;而 Step 5 原本又从**那条日志**用正则取 pid,于是拿到
+> `child=0` → `Get-Process -Id 0` → 10 行全 `DEAD` —— 一个**假 FAIL**。
+> 现在改为:子进程**自己**把 pid 写进 `spike-console-inherit.pid`(且只在 spawn 真成功时写),
+> 启动器**逐行 flush**,Step 5 直接**读那个文件**。
+>
+> **两条禁令**:① 永远不要用 `| Out-String` 收集这里的输出;② 永远不要靠**匹配进程命令行**去
+> 找 pid —— 那个字面量会落在执行者自己的命令行里,本项目已经因此误杀过 agent 自己的 runner。
+> 认进程只能用显式 PID、端口属主或父子链 + 创建时间。
 
 - [ ] **Step 4: 睡 3 秒后枚举可见控制台窗口(判据:必须为空)**
 
@@ -143,28 +170,23 @@ Expected: `PASS: 没有可见控制台窗口`。
 - [ ] **Step 5: 观察 attached 子进程 5 分钟(判据:全程存活)**
 
 ```powershell
-# pid 从进程树取,不要从日志正则取 —— 见 Step 3 的实测修正(那行日志会被缓冲到 node 退出)。
-$spawner = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-  Where-Object { $_.CommandLine -match 'spike-console-inherit\.ps1' }
-$self = (Get-CimInstance Win32_Process -Filter "ParentProcessId=$($spawner.ProcessId)" |
-  Where-Object { $_.Name -eq 'node.exe' }).ProcessId
-$child = (Get-CimInstance Win32_Process -Filter "ParentProcessId=$self" |
-  Where-Object { $_.Name -eq 'node.exe' }).ProcessId
-"watch child=$child (parent=$self)"
+# pid 来自子进程自己写的 pid 文件 —— 不匹配任何进程命令行(见 Step 3 的警告)。
+$pidFile = Join-Path $env:USERPROFILE '.dsh\logs\spike-console-inherit.pid'
+$pids = Get-Content $pidFile -Encoding UTF8
+$child = [int]([regex]::Match(($pids -join "`n"), 'child=(\d+)').Groups[1].Value)
+$self  = [int]([regex]::Match(($pids -join "`n"), 'self=(\d+)').Groups[1].Value)
+"watch child=$child parent=$self"
 1..10 | ForEach-Object {
   $c = Get-Process -Id $child -ErrorAction SilentlyContinue
   $p = Get-Process -Id $self  -ErrorAction SilentlyContinue
   "$(Get-Date -Format HH:mm:ss)  child=$child=$(if ($c) { 'alive' } else { 'DEAD' })  parent=$self=$(if ($p) { 'alive' } else { 'DEAD' })"
   Start-Sleep -Seconds 30
 }
-# 交叉校验:等启动器退出后,日志里应当出现同一对 pid。
-Start-Sleep -Seconds 20
-Get-Content "$env:USERPROFILE\.dsh\logs\spike-console-inherit.log" -Encoding UTF8
 ```
 
-> 上面那段 `Where-Object … -match 'spike-console-inherit'` 只用于**筛选探针进程**,而本命令自身
-> 不会把这个字面量写进任何**进程命令行**(它只出现在脚本文件里)—— 这一点必须守住,项目里
-> 已经因为"用自己的命令行字面量杀进程"误杀过 agent 自己的 runner。
+> 若这一步读到 `child=0`,**先查 pid 文件的内容与时间戳**,别急着宣布 FAIL:零 pid 通常意味着
+> spawn 失败(此时 pid 文件里会写 `error=…`)或启动器仍在使用旧的缓冲写法。判据本身是
+> "子进程在父进程存活期间是否一直活着",不是"日志里有没有那行字"。
 
 Expected: 10 行全是 `alive`(5 分钟)。若中途 `DEAD`,**前提不成立,停止本计划**。
 
