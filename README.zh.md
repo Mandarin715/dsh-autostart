@@ -28,7 +28,8 @@ Windows 专用的 DeepSeek Harness 插件:在设置页一键启用「开机自�
 ### 环境与重启
 
 DSH 由一个**常驻看护进程**启动 —— 开机时由 `bootstrap.vbs` 跑
-`node service.js supervise --config <config.json>`。活得比 DSH 久的是这个看护进程:它从子进程句柄上
+`node service.js start --config <config.json>`(`start` 是 `supervise` 的别名,后者才是真正的入口;
+生成的 bootstrap.vbs 用的是 `start`)。活得比 DSH 久的是这个看护进程:它从子进程句柄上
 得知 DSH 退出,并且只在「这次退出是你从设置页要的重启」时才拉起新实例。
 
 只有当你点重启、而**当时还没有看护进程**在跑(例如 DSH 是你手动起来的)时,才需要从 DSH 内部先创建一个
@@ -181,7 +182,10 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "DSH Web" /f
 └── supervise.stop            # 通知活着的看护进程在 DSH 消失后收工
 ```
 
-后三个是**临时状态文件**:需要时创建、用完删除(全部尽力而为),不存在是正常的。
+后三个是**临时状态文件**:需要时创建、用完删除(全部尽力而为),不存在是正常的。但三者的清理时机并不一样:
+`supervise.pid` 和 `supervise.stop` 在持有它们的看护进程处理到时就删掉;而 `restart.request` 只有在它记名的
+那个 DSH **真的退出**时才会被消费 —— 所以一次被拒绝、或始终没走到那次退出的重启,它写的请求可以一直留在盘上,
+直到下一次匹配的退出把它取走。
 
 ## 服务没起来时怎么救
 

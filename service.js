@@ -132,6 +132,13 @@ export function spawnDsh(config, log = () => {}, deps = {}) {
   child.once('error', (error) => {
     log(`spawn error: ${error instanceof Error ? error.message : String(error)}`)
   })
+  // Close this process's copies of the two log handles. `spawn` has already handed them to the
+  // child, which holds its own; keeping ours open leaked two descriptors per spawn — per retry
+  // and per re-entrant restart — which was harmless while the helper was one-shot but is
+  // unbounded now that the supervisor is resident. Closing them cannot truncate the child's
+  // output: it writes through its own descriptors.
+  fs.closeSync(out)
+  fs.closeSync(err)
   // Deliberately NOT child.unref(): with `detached: false` the child's life is governed by
   // the console it is attached to, not by this handle, so unref would be inert — and its
   // old "the child outlives us" meaning is exactly what the contract above forbids.
@@ -231,7 +238,7 @@ export function runHook(config, log, deps = {}) {
  * knowing which of the two it was: a draining socket clears, while a genuinely foreign
  * listener keeps answering and the window expires exactly as before.
  */
-async function waitForFreePort(probe, port, log, deps = {}) {
+async function waitForFreePort(probe, port, deps = {}) {
   const windowMs = deps.takeoverPortWindowMs ?? DEFAULT_PORT_PROBE_WINDOW_MS
   const intervalMs = deps.portProbeIntervalMs ?? DEFAULT_PORT_PROBE_INTERVAL_MS
   const now = deps.now ?? Date.now
@@ -311,7 +318,7 @@ export async function runSupervise(input) {
       ;(deps.clearFile ?? clearFile)(pidFile)
       throw error
     }
-  } else if (!(await waitForFreePort(probe, config.dshPort, log, deps))) {
+  } else if (!(await waitForFreePort(probe, config.dshPort, deps))) {
     // A bare single probe cannot tell a live foreign service from a socket the kernel has not
     // released yet (measured 2026-09-12, docs/ACCEPTANCE.md F8 "restart race"), and standing
     // down on a draining socket would exit reporting success while DSH is down. So the port is
@@ -333,7 +340,7 @@ export async function runSupervise(input) {
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     // A previous child may still hold the port.
     if (attempt > 1 || input.takeoverPid) {
-      const free = await waitForFreePort(probe, config.dshPort, log, deps)
+      const free = await waitForFreePort(probe, config.dshPort, deps)
       if (!free) {
         // Reachable from an ordinary retry as well as from a takeover, so the wording must not
         // claim a takeover happened.
@@ -344,7 +351,12 @@ export async function runSupervise(input) {
     const child = spawnImpl(config, log, deps)
     pid = child.pid
     spawned = attempt
-    log(`spawned dsh pid=${pid}${attempt > 1 ? ` (attempt ${attempt}/${attempts})` : ''}`)
+    // A failed spawn — ENOENT on a stale absolute path, the failure README §7 calls the most
+    // likely real one — yields a handle with no pid. Do not claim one.
+    log(
+      `spawned dsh${pid === undefined ? '' : ` pid=${pid}`}` +
+        (attempt > 1 ? ` (attempt ${attempt}/${attempts})` : ''),
+    )
     const up = await wait(config.dshPort, { timeoutMs: config.startTimeoutMs })
     if (up) {
       log(`port ${config.dshPort} is up`)
@@ -352,7 +364,13 @@ export async function runSupervise(input) {
       return await superviseChild({ config, configPath, log, deps, pid, child, requestFile, stopFile, pidFile })
     }
     log(`WARN port ${config.dshPort} did not come up in time (attempt ${attempt}/${attempts})`)
-    if (isAlive(pid)) {
+    // A pid-less child is never "still alive": isAlive(undefined) is FALSE by contract, so this
+    // asks about nothing and can never stand the loop down. Guarding it (rather than asking) is
+    // the point: defaultIsAlive(undefined) calls process.kill(undefined, 0), which throws a
+    // TypeError whose code is not ESRCH, so the liveness rule answers ALIVE and the loop would
+    // break after one attempt while logging "still alive" about a process that does not exist —
+    // collapsing the documented retry and lying in the user's only diagnostic.
+    if (pid !== undefined && isAlive(pid)) {
       log(`previous pid ${pid} is still alive; not starting a second instance`)
       break
     }
@@ -363,7 +381,12 @@ export async function runSupervise(input) {
     delayMs = Math.round(delayMs * (deps.superviseBackoffFactor ?? DEFAULT_SUPERVISE_BACKOFF_FACTOR))
   }
   log(`giving up: DSH did not come up after ${spawned} attempt(s); supervisor exiting`)
-  ;(deps.clearFile ?? clearFile)(pidFile)
+  // Only clear a pid file that is still ours. This process writes its own pid before the start
+  // loop, but two launches in the same millisecond can both pass the guard, and an unconditional
+  // clear would then delete the WINNER's pid file — disarming the single-instance guard for
+  // whoever comes next. On every normal path the file holds this process's pid, so this changes
+  // nothing there.
+  if (readPid(pidFile) === process.pid) (deps.clearFile ?? clearFile)(pidFile)
   return { supervised: false, reason: 'start-failed' }
 }
 
@@ -398,12 +421,22 @@ async function superviseChild(input) {
   let currentChild = child
   for (;;) {
     await waitExit(current, currentChild)
-    if (stopped(stopFile, process.pid)) {
-      log('stop requested; supervisor exiting')
-      clear(pidFile)
-      return { supervised: false, reason: 'stopped' }
-    }
+    // The request is checked BEFORE the stop marker, and the order is load-bearing. Both files
+    // can be pending at once and they are about different processes: the request names the child
+    // that just exited, the stop marker names this supervisor. `isStopRequested` DELETES the
+    // marker when it matches, so checking it first would abandon the request (and leave it on
+    // disk) and report `stopped` — turning a restart the user asked for into a shutdown with DSH
+    // down. It is reachable from the card: index.js writes the marker on every Disable while a
+    // supervisor is live, nothing there retracts it, and the restart button stays enabled.
+    //
+    // A stop that is pending while a restart IS requested must not be consumed here: it names
+    // this supervisor, not the child, so it has to survive the restart and govern the next exit.
     if (!consumed(requestFile, current)) {
+      if (stopped(stopFile, process.pid)) {
+        log('stop requested; supervisor exiting')
+        clear(pidFile)
+        return { supervised: false, reason: 'stopped' }
+      }
       log(`dsh pid=${current} exited without a restart request; nothing to do`)
       clear(pidFile)
       return { supervised: true, pid: current, child: currentChild }

@@ -845,12 +845,22 @@ async function superviseChild(input) {
   let currentChild = child
   for (;;) {
     await waitExit(current, currentChild)
-    if (stopped(stopFile, process.pid)) {
-      log('stop requested; supervisor exiting')
-      clear(pidFile)
-      return { supervised: false, reason: 'stopped' }
-    }
+    // The request is checked BEFORE the stop marker, and the order is load-bearing. Both files
+    // can be pending at once and they are about different processes: the request names the child
+    // that just exited, the stop marker names this supervisor. `isStopRequested` DELETES the
+    // marker when it matches, so checking it first would abandon the request (and leave it on
+    // disk) and report `stopped` — turning a restart the user asked for into a shutdown with DSH
+    // down. It is reachable from the card: index.js writes the marker on every Disable while a
+    // supervisor is live, nothing there retracts it, and the restart button stays enabled.
+    //
+    // A stop that is pending while a restart IS requested must not be consumed here: it names
+    // this supervisor, not the child, so it has to survive the restart and govern the next exit.
     if (!consumed(requestFile, current)) {
+      if (stopped(stopFile, process.pid)) {
+        log('stop requested; supervisor exiting')
+        clear(pidFile)
+        return { supervised: false, reason: 'stopped' }
+      }
       log(`dsh pid=${current} exited without a restart request; nothing to do`)
       clear(pidFile)
       return { supervised: true, pid: current, child: currentChild }

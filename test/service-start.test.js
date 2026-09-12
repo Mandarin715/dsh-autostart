@@ -292,6 +292,39 @@ test('spawnDsh re-asserts the DSH_HOME captured at enable time', () => {
   }
 })
 
+test('spawnDsh closes its own copies of the two log descriptors', () => {
+  // The supervisor is resident and respawns on every requested restart, so two descriptors left
+  // open per spawn is unbounded, not a one-shot detail. `spawn` gives the child its own handles,
+  // so this process must close its copies. Asserted with the real fds and the real fs: fstatSync
+  // throws EBADF once a descriptor is closed.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-spawn3-'))
+  try {
+    let captured = null
+    const config = baseConfig({
+      command: { execPath: process.execPath, argv: ['-e', '0'], cwd: dir },
+      logPaths: {
+        out: path.join(dir, 'out.log'),
+        err: path.join(dir, 'err.log'),
+        service: path.join(dir, 'service.log'),
+      },
+    })
+    spawnDsh(config, () => {}, {
+      spawn: (command, args, options) => {
+        captured = options.stdio[1]
+        return { once() {}, unref() {} }
+      },
+    })
+    assert.equal(typeof captured, 'number', 'the child must still have been handed a real descriptor')
+    assert.throws(
+      () => fs.fstatSync(captured),
+      /EBADF/,
+      'the parent must not keep the stdout descriptor open after spawning',
+    )
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('spawnDsh leaves the environment alone when no dshHome was captured', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-spawn2-'))
   try {
@@ -455,6 +488,45 @@ test('runSupervise retries a start that never came up, until the attempt limit',
     // the old `${attempts}` code also printed 3 on this path — it is a guard so that a future
     // edit to the new `spawned` arithmetic, or a reintroduction of the cap, breaks loudly.
     assert.match(lines.join('\n'), /giving up: DSH did not come up after 3 attempt\(s\)/)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise keeps retrying when a spawn produced no pid', async () => {
+  // A failed spawn (ENOENT on a stale absolute path — README §7's most likely real autostart
+  // failure) gives a handle whose pid is undefined. `isAlive(undefined)` is not "gone": with the
+  // real defaultIsAlive, process.kill(undefined, 0) throws ERR_INVALID_ARG_TYPE, whose code is not
+  // ESRCH, so the liveness rule answers ALIVE. The loop then breaks after a single attempt and logs
+  // "still alive" about a process that does not exist, making the documented 5-attempt backoff
+  // false and putting the falsehood in the user's only diagnostic.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup11-'))
+  try {
+    const lines = []
+    let spawns = 0
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 10 }),
+      configPath: path.join(dir, 'config.json'),
+      log: (line) => lines.push(line),
+      deps: {
+        isPortListening: async () => false,
+        waitForPort: async () => false,
+        // No pid: the shape a failed spawn produces.
+        spawnDsh: () => {
+          spawns += 1
+          return { pid: undefined, exitCode: null, signalCode: null, once() { return this } }
+        },
+        runHook: async () => ({ ran: false }),
+        // The REAL liveness rule, deliberately: stubbing it away is what let this hide.
+        superviseAttempts: 3,
+        sleep: async () => {},
+        now: (() => { let t = 0; return () => (t += 60000) })(),
+      },
+    })
+    assert.equal(spawns, 3, 'a pid-less spawn must be retried, not treated as a live competitor')
+    const text = lines.join('\n')
+    assert.doesNotMatch(text, /is still alive/, 'nothing was alive: the pid was never obtained')
+    assert.doesNotMatch(text, /pid=undefined/, 'do not report a pid that does not exist')
+    assert.match(text, /giving up: DSH did not come up after 3 attempt\(s\)/)
+    assert.equal(result.supervised, false)
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
 
@@ -694,8 +766,53 @@ test('runSupervise restarts DSH only when the exit was requested', async () => {
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
 
-test('runSupervise does not resurrect DSH when the exit was not requested', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup5-'))
+test('runSupervise honours a requested restart even when a stop marker is already pending', { timeout: 1000 }, async () => {
+  // The two intents can coexist, and they are about different processes: the request names the
+  // child that just exited, the stop marker names this supervisor. `isStopRequested` DELETES the
+  // marker on a match, so checking the stop first would swallow the restart request (leaving it on
+  // disk) and report `stopped`. This is reachable from the card, not theory: index.js writes the
+  // marker on every Disable while a supervisor is live and nothing there can retract it, while the
+  // restart button is still enabled in exactly that state. Two clicks — Disable, then Restart —
+  // would otherwise leave DSH down with the login entry already gone.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup10-'))
+  try {
+    const lines = []
+    let spawns = 0
+    const first = fakeChild(111)
+    const second = fakeChild(222)
+    writeRestartRequest(path.join(dir, 'restart.request'), 111)
+    // Pending before the loop starts, aimed at this supervisor, and it must survive the restart.
+    writePid(path.join(dir, 'supervise.stop'), process.pid)
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 10 }),
+      configPath: path.join(dir, 'config.json'),
+      log: (line) => lines.push(line),
+      deps: {
+        isPortListening: async () => false,
+        waitForPort: async () => true,
+        spawnDsh: () => { spawns += 1; return spawns === 1 ? first : second },
+        runHook: async () => ({ ran: false }),
+        isProcessAlive: () => false,
+        waitForProcessExit: async () => true,
+        waitForChildExit: async (pid) => pid,
+        sleep: async () => {},
+      },
+    })
+    assert.equal(spawns, 2, 'the restart that was asked for must be honoured, not turned into a shutdown')
+    assert.equal(result.supervised, false, 'the pending stop must still end the session, not be forgotten')
+    const text = lines.join('\n')
+    assert.match(text, /restart requested for pid=111/)
+    assert.match(text, /stop requested/)
+    assert.equal(readPid(path.join(dir, 'restart.request')), null, 'the request must be consumed, not abandoned')
+    // `result.reason` is deliberately NOT pinned. With the marker pending from the start, the
+    // replacement start's own re-entrant superviseChild call (service.js:422 through :436) is the
+    // one that reaches the next exit, so it consumes the marker and returns `stopped`, and the
+    // outer frame turns that into `restart-failed` (service.js:429-432). Pinning either string
+    // here would be pinning this frame's shape rather than the ordering property under test.
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise does not resurrect DSH when the exit was not requested', async () => {  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup5-'))
   try {
     const lines = []
     let spawns = 0

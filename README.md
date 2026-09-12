@@ -28,8 +28,9 @@ The software is provided "as is" (MIT License, no warranty of any kind).
 
 ### Environment and restart
 
-DSH is started by a **resident supervisor** — `node service.js supervise --config <config.json>`, launched by
-`bootstrap.vbs` at login. The supervisor is what outlives DSH: it learns of DSH's exit from its child handle, and
+DSH is started by a **resident supervisor** — `node service.js start --config <config.json>`, launched by
+`bootstrap.vbs` at login (`start` is an alias of `supervise`, which is the real entry point; the generated
+bootstrap.vbs uses `start`). The supervisor is what outlives DSH: it learns of DSH's exit from its child handle, and
 starts the replacement when the exit was a restart you asked for.
 
 When you click restart and **no supervisor is running yet** (for example you started DSH by hand), one has to be
@@ -191,7 +192,10 @@ this plugin be your only autostart entry.
 ```
 
 The last three are transient state files: they are created and deleted as needed (all best-effort), and their absence
-is normal.
+is normal. They are not all cleared the same way, though. `supervise.pid` and `supervise.stop` are removed whenever
+the supervisor that owns them acts on them, but a `restart.request` is consumed only when the DSH it names actually
+exits — so a request from a restart that was refused, or that never reached that exit, can survive on disk until the
+next matching exit picks it up.
 
 ## If the service will not start (recovery)
 
