@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { runStart, runSupervise, runHook, spawnDsh, scheduleSecondChance, main } from '../service.js'
-import { writePid } from '../lib/supervise-state.js'
+import { readPid, writePid } from '../lib/supervise-state.js'
 
 function baseConfig(overrides = {}) {
   return {
@@ -543,6 +543,7 @@ test('runSupervise starts DSH once and reports that it is supervising', async ()
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup-'))
   try {
     const spawned = []
+    let hooked = 0
     const result = await runSupervise({
       config: baseConfig({ startTimeoutMs: 1000 }),
       configPath: path.join(dir, 'config.json'),
@@ -551,14 +552,17 @@ test('runSupervise starts DSH once and reports that it is supervising', async ()
         isPortListening: async () => false,
         waitForPort: async () => true,
         spawnDsh: () => { spawned.push(1); return 4242 },
-        runHook: async () => ({ ran: false }),
+        runHook: async () => { hooked += 1; return { ran: false } },
         isProcessAlive: () => false,
-        // The loop ends when the child exits without a restart request.
+        // Task 4 returns as soon as the port is up and the hook has run; the supervision loop
+        // that would call this belongs to Task 5. It is injected so the Task 5 test can keep
+        // this body once that loop exists.
         waitForChildExit: async () => 0,
         sleep: async () => {},
       },
     })
     assert.equal(spawned.length, 1)
+    assert.equal(hooked, 1, 'the start phase ends by running the hook')
     assert.deepEqual(result, { supervised: true, pid: 4242 })
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
@@ -604,6 +608,175 @@ test('runSupervise stands down when another supervisor is already alive', async 
       },
     })
     assert.deepEqual(result, { supervised: false, reason: 'already-running' })
-    assert.match(lines.join('\n'), /already running/)
+    assert.match(lines.join('\n'), /already running \(999\)/)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise waits out a draining socket instead of accepting the port as busy', async () => {
+  // Measured 2026-09-12 (docs/ACCEPTANCE.md, "restart race"): a probe landing the instant
+  // after a process dies can be answered by a socket the kernel has not released yet. A
+  // single bare probe here would make the supervisor exit reporting success while DSH is
+  // down and nobody is left to start it — the exact failure runStart re-probes to avoid.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup4-'))
+  try {
+    const lines = []
+    let probes = 0
+    let spawns = 0
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 10 }),
+      configPath: path.join(dir, 'config.json'),
+      log: (line) => lines.push(line),
+      deps: {
+        // The first probe lands on the draining socket; the next one finds it gone.
+        isPortListening: async () => {
+          probes += 1
+          return probes === 1
+        },
+        // Deterministic clock over a 5000ms window: one 1000ms tick between the two probes.
+        now: (() => { let t = 0; return () => (t += 1000) })(),
+        sleep: async () => {},
+        waitForPort: async () => true,
+        spawnDsh: () => { spawns += 1; return 4242 },
+        runHook: async () => ({ ran: false }),
+        isProcessAlive: () => false,
+        takeoverPortWindowMs: 5000,
+        portProbeIntervalMs: 1,
+      },
+    })
+    assert.equal(probes, 2, 'the busy answer must be re-probed, not accepted once')
+    assert.equal(spawns, 1, 'a draining socket must not stop the start')
+    assert.deepEqual(result, { supervised: true, pid: 4242 })
+    assert.doesNotMatch(lines.join('\n'), /port-busy|standing down/)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise stands down when the port still answers after the drain window', async () => {
+  // The retry must not weaken the property the single probe existed for: a genuinely foreign
+  // listener keeps answering, so the window expires and no competing DSH is started.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup5-'))
+  try {
+    const lines = []
+    let probes = 0
+    const result = await runSupervise({
+      config: baseConfig(),
+      configPath: path.join(dir, 'config.json'),
+      log: (line) => lines.push(line),
+      deps: {
+        isPortListening: async () => {
+          probes += 1
+          return true
+        },
+        now: (() => { let t = 0; return () => (t += 1000) })(),
+        sleep: async () => {},
+        spawnDsh: () => { throw new Error('must not start a competitor for a served port') },
+        takeoverPortWindowMs: 5000,
+        portProbeIntervalMs: 1,
+      },
+    })
+    assert.ok(probes > 1, `expected the probe to be retried, got ${probes} probes`)
+    assert.deepEqual(result, { supervised: false, reason: 'port-busy' })
+    assert.match(lines.join('\n'), /served by something else/)
+    assert.equal(readPid(path.join(dir, 'supervise.pid')), null, 'standing down must clear the pid file')
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise does not retry while the failed child is still alive', async () => {
+  // A live child may still bind the port a moment later, and spawning a second instance at
+  // that point is how two DSH processes end up racing for the same port.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup6-'))
+  try {
+    const lines = []
+    let spawns = 0
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 10 }),
+      configPath: path.join(dir, 'config.json'),
+      log: (line) => lines.push(line),
+      deps: {
+        isPortListening: async () => false,
+        waitForPort: async () => false,
+        spawnDsh: () => { spawns += 1; return 6000 },
+        isProcessAlive: () => true,
+        runHook: async () => ({ ran: false }),
+        superviseAttempts: 3,
+        sleep: async () => {},
+      },
+    })
+    assert.equal(spawns, 1, 'the live child gets its port wait to itself')
+    assert.deepEqual(result, { supervised: false, reason: 'start-failed' })
+    const text = lines.join('\n')
+    assert.match(text, /still alive/)
+    // The log is the user's only diagnostic, so the count must match the line above it.
+    assert.match(text, /giving up: DSH did not come up after 1 attempt\(s\)/)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise stops retrying once the total time budget is spent', async () => {
+  // The retry is bounded twice over: attempt count AND total elapsed time. The default budget
+  // is unreachable here — 5 attempts of startTimeoutMs never reach the 5-minute default — so
+  // the bound only ever trips when the values are injected, as they are below.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup7-'))
+  try {
+    const lines = []
+    let spawns = 0
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 10 }),
+      configPath: path.join(dir, 'config.json'),
+      log: (line) => lines.push(line),
+      deps: {
+        isPortListening: async () => false,
+        waitForPort: async () => false,
+        spawnDsh: () => { spawns += 1; return 7000 },
+        isProcessAlive: () => false,
+        runHook: async () => ({ ran: false }),
+        superviseAttempts: 10,
+        superviseTotalMs: 5000,
+        superviseBackoffMs: 1000,
+        // Deterministic clock: every reading jumps a minute, so the first budget check
+        // (elapsed + the next delay) is already over the 5000ms budget.
+        now: (() => { let t = 0; return () => (t += 60000) })(),
+        sleep: async () => {},
+      },
+    })
+    assert.equal(spawns, 1, 'the budget must stop the loop long before the attempt limit')
+    assert.deepEqual(result, { supervised: false, reason: 'start-failed' })
+    const text = lines.join('\n')
+    assert.doesNotMatch(text, /still alive/)
+    assert.match(text, /giving up: DSH did not come up after 1 attempt\(s\)/)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise refuses to spawn a retry while the port still answers', async () => {
+  // The pre-spawn drain wait is what stops attempt 2 from racing a child whose socket is
+  // still up. When it never drains, the honest outcome is to stand down, not to spawn.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup8-'))
+  try {
+    const lines = []
+    let probes = 0
+    let spawns = 0
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 10 }),
+      configPath: path.join(dir, 'config.json'),
+      log: (line) => lines.push(line),
+      deps: {
+        isPortListening: async () => {
+          probes += 1
+          return probes > 1
+        },
+        now: (() => { let t = 0; return () => (t += 1000) })(),
+        sleep: async () => {},
+        waitForPort: async () => false,
+        spawnDsh: () => { spawns += 1; return 8000 },
+        isProcessAlive: () => false,
+        runHook: async () => ({ ran: false }),
+        superviseAttempts: 2,
+        takeoverPortWindowMs: 5000,
+        portProbeIntervalMs: 1,
+      },
+    })
+    assert.equal(spawns, 1, 'the retry must not spawn while the port still answers')
+    assert.deepEqual(result, { supervised: false, reason: 'start-failed' })
+    const text = lines.join('\n')
+    assert.match(text, /still answers after waiting for it to drain/)
+    assert.match(text, /giving up: DSH did not come up after 1 attempt\(s\)/)
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })

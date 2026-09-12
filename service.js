@@ -353,8 +353,12 @@ export async function runSupervise(input) {
       ;(deps.clearFile ?? clearFile)(pidFile)
       return { supervised: false, reason: 'takeover-timeout' }
     }
-  } else if (await probe(config.dshPort)) {
-    log(`port ${config.dshPort} already answers and no takeover was requested; standing down`)
+  } else if (!(await waitForFreePort(probe, config.dshPort, log, deps))) {
+    // A bare single probe cannot tell a live foreign service from a socket the kernel has not
+    // released yet (measured 2026-09-12, see runStart), and standing down on a draining socket
+    // would exit reporting success while DSH is down. So the port is re-probed over the whole
+    // window and only a port that still answers afterwards is called someone else's.
+    log(`port ${config.dshPort} is served by something else after waiting ${deps.takeoverPortWindowMs ?? DEFAULT_PORT_PROBE_WINDOW_MS}ms; standing down`)
     ;(deps.clearFile ?? clearFile)(pidFile)
     return { supervised: false, reason: 'port-busy' }
   }
@@ -363,23 +367,31 @@ export async function runSupervise(input) {
   const startedAt = (deps.now ?? Date.now)()
   let delayMs = deps.superviseBackoffMs ?? DEFAULT_SUPERVISE_BACKOFF_MS
   let pid = null
+  // Counts the attempts actually made, so the give-up line below reports the truth. Printing
+  // the configured cap there contradicts the "(attempt n/N)" line that precedes it whenever the
+  // loop breaks early — and service.log is the only diagnostic the user has.
+  let spawned = 0
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     // A previous child may still hold the port.
     if (attempt > 1 || input.takeoverPid) {
       const free = await waitForFreePort(probe, config.dshPort, log, deps)
       if (!free) {
-        log(`port ${config.dshPort} still answers after the takeover window; standing down`)
+        // Reachable from an ordinary retry as well as from a takeover, so the wording must not
+        // claim a takeover happened.
+        log(`port ${config.dshPort} still answers after waiting for it to drain; standing down`)
         break
       }
     }
     pid = spawnImpl(config, log, deps)
+    spawned = attempt
     log(`spawned dsh pid=${pid}${attempt > 1 ? ` (attempt ${attempt}/${attempts})` : ''}`)
     const up = await wait(config.dshPort, { timeoutMs: config.startTimeoutMs })
     if (up) {
       log(`port ${config.dshPort} is up`)
       await hook(config, log, deps)
-      // Task 5 continues here: watch `pid` against requestFile/stopFile and restart on
-      // request. Until then a started supervisor reports success and returns.
+      // Task 5 continues here: it takes `pid` plus the `requestFile` / `stopFile` paths derived
+      // above, waits for that child to exit, honours a restart request naming it, and restarts.
+      // They are derived here on purpose — Task 5's superviseChild consumes exactly these two.
       return { supervised: true, pid }
     }
     log(`WARN port ${config.dshPort} did not come up in time (attempt ${attempt}/${attempts})`)
@@ -393,7 +405,7 @@ export async function runSupervise(input) {
     await sleep(delayMs)
     delayMs = Math.round(delayMs * (deps.superviseBackoffFactor ?? DEFAULT_SUPERVISE_BACKOFF_FACTOR))
   }
-  log(`giving up: DSH did not come up after ${attempts} attempt(s); supervisor exiting`)
+  log(`giving up: DSH did not come up after ${spawned} attempt(s); supervisor exiting`)
   ;(deps.clearFile ?? clearFile)(pidFile)
   return { supervised: false, reason: 'start-failed' }
 }
