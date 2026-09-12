@@ -813,7 +813,8 @@ test('runSupervise honours a requested restart even when a stop marker is alread
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
 
-test('runSupervise does not resurrect DSH when the exit was not requested', async () => {  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup5-'))
+test('runSupervise does not resurrect DSH when the exit was not requested', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup5-'))
   try {
     const lines = []
     let spawns = 0

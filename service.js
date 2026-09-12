@@ -364,12 +364,12 @@ export async function runSupervise(input) {
       return await superviseChild({ config, configPath, log, deps, pid, child, requestFile, stopFile, pidFile })
     }
     log(`WARN port ${config.dshPort} did not come up in time (attempt ${attempt}/${attempts})`)
-    // A pid-less child is never "still alive": isAlive(undefined) is FALSE by contract, so this
-    // asks about nothing and can never stand the loop down. Guarding it (rather than asking) is
-    // the point: defaultIsAlive(undefined) calls process.kill(undefined, 0), which throws a
-    // TypeError whose code is not ESRCH, so the liveness rule answers ALIVE and the loop would
-    // break after one attempt while logging "still alive" about a process that does not exist —
-    // collapsing the documented retry and lying in the user's only diagnostic.
+    // A pid-less child must never be treated as "still alive", and the guard below is what makes
+    // that true — it is not obvious. Without it, defaultIsAlive(undefined) calls
+    // process.kill(undefined, 0), which throws a TypeError whose code is not ESRCH, so the
+    // liveness rule answers ALIVE (measured 2026-09-12). The loop would then break after one
+    // attempt while logging "still alive" about a process that does not exist — collapsing the
+    // documented retry and lying in the user's only diagnostic.
     if (pid !== undefined && isAlive(pid)) {
       log(`previous pid ${pid} is still alive; not starting a second instance`)
       break
@@ -467,8 +467,12 @@ async function superviseChild(input) {
       // start (the `spawned dsh` and `port is up` lines above it), in the user's only diagnostic.
       // The nested reason is what tells the two apart, so it is propagated, not overwritten.
       const reason = next.reason ?? 'restart-failed'
-      // Only these reasons mean the start itself failed; every other reason describes an end that
-      // came after a successful start.
+      // These four are the reasons `runSupervise` can return when no child ever reached the
+      // supervision loop. Everything else describes an end that came after a successful start —
+      // with one known exception a reviewer reproduced: a `start-failed` propagated up from a
+      // nested frame (three generations plus a failing start) reaches this test too, so the outer
+      // frame prints "did not come up" about a replacement that did start. The outcome is
+      // identical either way; only that word is wrong.
       const startFailed = ['start-failed', 'takeover-timeout', 'port-busy', 'already-running'].includes(reason)
       log(startFailed ? 'replacement did not come up; supervisor exiting' : `replacement ${reason}; supervisor exiting`)
       clear(pidFile)

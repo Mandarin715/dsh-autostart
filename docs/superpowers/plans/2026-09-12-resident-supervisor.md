@@ -884,9 +884,13 @@ async function superviseChild(input) {
       takeoverPid: current,
     })
     if (!next.supervised || !next.pid) {
-      log('replacement did not come up; supervisor exiting')
+      // The nested frame's own reason is propagated, not overwritten: a replacement that started
+      // and then ended (e.g. `stopped`) must not be reported as "did not come up".
+      const reason = next.reason ?? 'restart-failed'
+      const startFailed = ['start-failed', 'takeover-timeout', 'port-busy', 'already-running'].includes(reason)
+      log(startFailed ? 'replacement did not come up; supervisor exiting' : `replacement ${reason}; supervisor exiting`)
       clear(pidFile)
-      return { supervised: false, reason: 'restart-failed' }
+      return { supervised: false, reason }
     }
     current = next.pid
     currentChild = next.child
