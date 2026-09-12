@@ -972,13 +972,17 @@ test('runSupervise learns of the exit from the child handle, not by polling the 
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
 
-test('runSupervise does not hang when the child exited before the listener was attached', async () => {
+test('runSupervise does not hang when the child exited before the listener was attached', { timeout: 1000 }, async () => {
   // runSupervise only reaches superviseChild after waitForPort and the hook have run, so a child
   // that died in that window already emitted 'exit' — and Node does not replay events. Without
   // the exitCode/signalCode guard the loop would wait forever on a dead child while still holding
   // supervise.pid, which also blocks the single-instance guard. This is a regression pin for that
   // hang, not a mechanism RED: it passes against the old polling default too, because a fake pid
   // that does not exist makes defaultIsAlive report "gone".
+  //
+  // The 1000ms budget is the point. If the guard at superviseChild's default wait regresses, the
+  // default never resolves and this test would otherwise hang the whole file rather than fail —
+  // a hang names no test and reports no assertion. The budget turns the regression into a failure.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup8-'))
   try {
     const child = exitedChild(4242)
@@ -997,5 +1001,53 @@ test('runSupervise does not hang when the child exited before the listener was a
     assert.equal(result.supervised, true)
     assert.equal(result.pid, 4242)
     assert.equal(readPid(path.join(dir, 'supervise.pid')), null, 'an ended story must not leave its pid behind')
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise watches the replacement handle when it restarts, by event', { timeout: 2000 }, async () => {
+  // The wiring no test covered: after a honoured restart, `currentChild = next.child` and the loop
+  // waits on the *replacement's* handle. A mistake there — watching a stale handle — would hang a
+  // real supervisor silently, and the structural test injects waitForChildExit, so its second
+  // iteration never touches the default. Here nothing is injected: both exits arrive as events.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup9-'))
+  try {
+    const first = fakeChild(process.pid, { exit: false })
+    const second = fakeChild(222, { exit: false })
+    let spawns = 0
+    // The first child's pid is THIS test process's real, live pid, and its exit was requested.
+    // That is deliberate: the restart path must not poll the pid of a child whose handle already
+    // told us it exited, and using a live pid makes the consequence deterministic instead of
+    // dependent on Windows pid arithmetic — the real waitForProcessExit would see "alive", stall
+    // for the 30s takeover default and then abandon the restart. Without the short-circuit this
+    // test's budget expires instead of passing.
+    writeRestartRequest(path.join(dir, 'restart.request'), process.pid)
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 10 }),
+      configPath: path.join(dir, 'config.json'),
+      log: () => {},
+      deps: {
+        isPortListening: async () => false,
+        waitForPort: async () => true,
+        spawnDsh: () => {
+          spawns += 1
+          return spawns === 1 ? first : second
+        },
+        runHook: async () => {
+          // Each handle's exit fires only once the handle is spawned; firing the second is what
+          // proves the loop moved on to it rather than still waiting on the first.
+          setImmediate(() => (spawns === 1 ? first : second).close())
+          return { ran: false }
+        },
+        isProcessAlive: () => false,
+        // waitForChildExit is deliberately NOT injected, so both iterations use the default.
+        // The takeover wait needs no injection either: I1 makes the restart path short-circuit it.
+      },
+    })
+    assert.equal(spawns, 2, 'the requested restart must respawn exactly once')
+    assert.deepEqual(first.subscriptions, ['exit'], 'the first handle must be watched by event')
+    assert.deepEqual(second.subscriptions, ['exit'], 'the replacement handle must be watched by event')
+    assert.equal(result.supervised, true)
+    assert.equal(result.pid, 222)
+    assert.equal(result.child, second, 'the loop must end watching the replacement, not a stale handle')
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })

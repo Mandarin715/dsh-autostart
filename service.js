@@ -324,8 +324,10 @@ async function waitForFreePort(probe, port, log, deps = {}) {
  *     it and then start ours. Without this shape an on-demand supervisor would see a busy
  *     port, stand down, and leave nobody to restart DSH when the old one exits.
  *
- * This task covers the start phase only (guard, takeover wait, probe, bounded retry, hook);
- * Task 5 adds the supervision loop that follows a successful start.
+ * This function covers the start phase (guard, takeover wait, probe, bounded retry, hook) and,
+ * once DSH is up, hands the running child to superviseChild — the supervision loop that decides
+ * what happens when it exits. A successful return therefore means either that the port was busy
+ * and this process stood down, or that a supervised DSH has since exited and the story ended.
  */
 export async function runSupervise(input) {
   const { config, configPath, log } = input
@@ -465,11 +467,19 @@ async function superviseChild(input) {
     log(`restart requested for pid=${current}; starting a replacement`)
     // Re-run the start phase for one attempt; runSupervise's own guard is skipped because
     // we already own the pid file.
+    //
+    // The takeover wait is short-circuited because we are here only after this very child's
+    // 'exit' event fired, while still holding its handle — proof it is gone. Leaving it to
+    // waitForProcessExit would poll the pid instead: if the pid still reports alive (reuse, or
+    // EPERM, which defaultIsAlive counts as alive) the replacement stalls for the whole 30s
+    // takeover timeout, then reports restart-failed — after the restart request was already
+    // consumed and deleted. That would abandon a user-requested restart silently, with DSH
+    // down. R18's rule applies to this wait exactly as it does to the loop's own.
     const next = await runSupervise({
       config,
       configPath,
       log,
-      deps: { ...deps, anotherSupervisorAlive: () => false },
+      deps: { ...deps, anotherSupervisorAlive: () => false, waitForProcessExit: async () => true },
       takeoverPid: current,
     })
     if (!next.supervised || !next.pid) {
