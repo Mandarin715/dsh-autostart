@@ -15,6 +15,12 @@ import { fileURLToPath } from 'node:url'
 import { isPortListening, waitForPort } from './lib/port.js'
 import { parseConfigFile, resolveDshHome, configFilePath } from './lib/config.js'
 import { powershellPath } from './lib/launch-helper.js'
+import {
+  anotherSupervisorAlive,
+  readPid,
+  writePid,
+  clearFile,
+} from './lib/supervise-state.js'
 
 const SERVICE_JS = fileURLToPath(import.meta.url)
 
@@ -37,6 +43,18 @@ const DEFAULT_SECOND_CHANCE_DELAY_MS = 60000
 
 // Upper bound for --delay, so a mistyped value cannot park a process for days.
 const MAX_DELAY_MS = 24 * 60 * 60 * 1000
+
+// How long `supervise --takeover <pid>` waits for that DSH to exit before concluding it is
+// not going to. See runSupervise: without the takeover shape an on-demand supervisor would
+// see a busy port, stand down, and leave nobody to restart DSH when the old one exits.
+const DEFAULT_TAKEOVER_EXIT_MS = 30000
+
+// The supervisor retries a start that never came up. Backoff grows 1s, 1.5s, 2.25s … and
+// the whole effort is bounded so a permanently broken command cannot retry forever.
+const DEFAULT_SUPERVISE_ATTEMPTS = 5
+const DEFAULT_SUPERVISE_BACKOFF_MS = 1000
+const DEFAULT_SUPERVISE_BACKOFF_FACTOR = 1.5
+const DEFAULT_SUPERVISE_TOTAL_MS = 5 * 60 * 1000
 
 /** Load and validate config.json. */
 export function readConfig(configPath) {
@@ -74,6 +92,10 @@ export function dshEnv(config, base = process.env) {
  * child of a WMI-created parent is gone within ~10s of that parent exiting), so this
  * function may only be called by a process that stays alive for DSH's whole lifetime —
  * the supervisor.
+ *
+ * TODO(Task 7): the one-shot `start` path still calls this from a helper that exits
+ * immediately, so that contract is violated by this file's own caller until the CLI is
+ * moved onto the supervisor.
  */
 export function spawnDsh(config, log = () => {}, deps = {}) {
   // parseConfigFile does not validate logPaths (it cannot — it never receives
@@ -99,7 +121,9 @@ export function spawnDsh(config, log = () => {}, deps = {}) {
   child.once('error', (error) => {
     log(`spawn error: ${error instanceof Error ? error.message : String(error)}`)
   })
-  child.unref()
+  // Deliberately NOT child.unref(): with `detached: false` the child's life is governed by
+  // the console it is attached to, not by this handle, so unref would be inert — and its
+  // old "the child outlives us" meaning is exactly what the contract above forbids.
   return child.pid
 }
 
@@ -261,6 +285,117 @@ export async function runStart(input) {
     await schedule({ configPath: input.configPath, config, log, deps })
   }
   return { started: true, pid, up: false }
+}
+
+/** Wait, briefly, for the port to stop answering before spawning a replacement. */
+async function waitForFreePort(probe, port, log, deps = {}) {
+  const windowMs = deps.takeoverPortWindowMs ?? DEFAULT_PORT_PROBE_WINDOW_MS
+  const intervalMs = deps.portProbeIntervalMs ?? DEFAULT_PORT_PROBE_INTERVAL_MS
+  const now = deps.now ?? Date.now
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+  const deadline = now() + windowMs
+  for (;;) {
+    if (!(await probe(port))) return true
+    if (now() >= deadline) return false
+    await sleep(intervalMs)
+  }
+}
+
+/**
+ * Own DSH's lifetime: start it attached to this process's console and stay alive.
+ *
+ * Kept alive on purpose — see spawnDsh. Two startup shapes share this function:
+ *   - plain `supervise`: start DSH if the port is free; if something else already serves
+ *     it, stand down (nothing to supervise);
+ *   - `supervise --takeover <pid>`: that `pid` is a DSH which is about to exit, so wait for
+ *     it and then start ours. Without this shape an on-demand supervisor would see a busy
+ *     port, stand down, and leave nobody to restart DSH when the old one exits.
+ *
+ * This task covers the start phase only (guard, takeover wait, probe, bounded retry, hook);
+ * Task 5 adds the supervision loop that follows a successful start.
+ */
+export async function runSupervise(input) {
+  const { config, configPath, log } = input
+  const deps = input.deps ?? {}
+  const probe = deps.isPortListening ?? isPortListening
+  const wait = deps.waitForPort ?? waitForPort
+  const spawnImpl = deps.spawnDsh ?? spawnDsh
+  const hook = deps.runHook ?? runHook
+  const isAlive = deps.isProcessAlive ?? defaultIsAlive
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+  // R2: the state files live beside config.json, which is the same directory Task 8's route
+  // computes as configDir(dshHome). Derived from configPath on purpose — never configDir.
+  const dir = path.dirname(configPath)
+  const pidFile = path.join(dir, 'supervise.pid')
+  const requestFile = path.join(dir, 'restart.request')
+  const stopFile = path.join(dir, 'supervise.stop')
+
+  // Load-bearing order: anotherSupervisorAlive only tests liveness — it cannot tell
+  // "another" from "ours" — so the guard must run before this process writes its own pid.
+  const guard = deps.anotherSupervisorAlive ?? anotherSupervisorAlive
+  if (guard(pidFile, isAlive)) {
+    // The pid is logged because this line is the only diagnostic: a stale pid file naming a
+    // pid that has since been reused by an unrelated live process would otherwise block
+    // startup with no explanation anywhere, and service.log is the user's only window in.
+    log(`another supervisor is already running (${readPid(pidFile)}); standing down`)
+    return { supervised: false, reason: 'already-running' }
+  }
+  const writePidImpl = deps.writePid ?? writePid
+  writePidImpl(pidFile, process.pid)
+  log(`supervisor pid=${process.pid} watching ${config.dshPort}`)
+
+  if (input.takeoverPid) {
+    log(`takeover: waiting for pid ${input.takeoverPid} to exit`)
+    const waitExit = deps.waitForProcessExit ?? waitForProcessExit
+    const gone = await waitExit(input.takeoverPid, { timeoutMs: deps.takeoverExitTimeoutMs ?? DEFAULT_TAKEOVER_EXIT_MS })
+    if (!gone) {
+      log(`takeover: pid ${input.takeoverPid} is still alive; standing down without starting`)
+      ;(deps.clearFile ?? clearFile)(pidFile)
+      return { supervised: false, reason: 'takeover-timeout' }
+    }
+  } else if (await probe(config.dshPort)) {
+    log(`port ${config.dshPort} already answers and no takeover was requested; standing down`)
+    ;(deps.clearFile ?? clearFile)(pidFile)
+    return { supervised: false, reason: 'port-busy' }
+  }
+
+  const attempts = deps.superviseAttempts ?? DEFAULT_SUPERVISE_ATTEMPTS
+  const startedAt = (deps.now ?? Date.now)()
+  let delayMs = deps.superviseBackoffMs ?? DEFAULT_SUPERVISE_BACKOFF_MS
+  let pid = null
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    // A previous child may still hold the port.
+    if (attempt > 1 || input.takeoverPid) {
+      const free = await waitForFreePort(probe, config.dshPort, log, deps)
+      if (!free) {
+        log(`port ${config.dshPort} still answers after the takeover window; standing down`)
+        break
+      }
+    }
+    pid = spawnImpl(config, log, deps)
+    log(`spawned dsh pid=${pid}${attempt > 1 ? ` (attempt ${attempt}/${attempts})` : ''}`)
+    const up = await wait(config.dshPort, { timeoutMs: config.startTimeoutMs })
+    if (up) {
+      log(`port ${config.dshPort} is up`)
+      await hook(config, log, deps)
+      // Task 5 continues here: watch `pid` against requestFile/stopFile and restart on
+      // request. Until then a started supervisor reports success and returns.
+      return { supervised: true, pid }
+    }
+    log(`WARN port ${config.dshPort} did not come up in time (attempt ${attempt}/${attempts})`)
+    if (isAlive(pid)) {
+      log(`previous pid ${pid} is still alive; not starting a second instance`)
+      break
+    }
+    if ((deps.now ?? Date.now)() - startedAt + delayMs > (deps.superviseTotalMs ?? DEFAULT_SUPERVISE_TOTAL_MS)) {
+      break
+    }
+    await sleep(delayMs)
+    delayMs = Math.round(delayMs * (deps.superviseBackoffFactor ?? DEFAULT_SUPERVISE_BACKOFF_FACTOR))
+  }
+  log(`giving up: DSH did not come up after ${attempts} attempt(s); supervisor exiting`)
+  ;(deps.clearFile ?? clearFile)(pidFile)
+  return { supervised: false, reason: 'start-failed' }
 }
 
 /**

@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { runStart, runHook, spawnDsh, scheduleSecondChance, main } from '../service.js'
+import { runStart, runSupervise, runHook, spawnDsh, scheduleSecondChance, main } from '../service.js'
+import { writePid } from '../lib/supervise-state.js'
 
 function baseConfig(overrides = {}) {
   return {
@@ -534,4 +535,75 @@ test('scheduleSecondChance spawns one detached, delayed start attempt', () => {
   assert.match(captured.args.join(' '), /--delay 60000/)
   assert.equal(captured.options.detached, true, 'it has to outlive the helper')
   assert.match(lines.join('\n'), /scheduled one more start attempt/)
+})
+
+// ---------------------------------------------------------------- supervisor
+
+test('runSupervise starts DSH once and reports that it is supervising', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup-'))
+  try {
+    const spawned = []
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 1000 }),
+      configPath: path.join(dir, 'config.json'),
+      log: () => {},
+      deps: {
+        isPortListening: async () => false,
+        waitForPort: async () => true,
+        spawnDsh: () => { spawned.push(1); return 4242 },
+        runHook: async () => ({ ran: false }),
+        isProcessAlive: () => false,
+        // The loop ends when the child exits without a restart request.
+        waitForChildExit: async () => 0,
+        sleep: async () => {},
+      },
+    })
+    assert.equal(spawned.length, 1)
+    assert.deepEqual(result, { supervised: true, pid: 4242 })
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise retries a start that never came up, until the attempt limit', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup2-'))
+  try {
+    const lines = []
+    let spawns = 0
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 10 }),
+      configPath: path.join(dir, 'config.json'),
+      log: (line) => lines.push(line),
+      deps: {
+        isPortListening: async () => false,
+        waitForPort: async () => false,
+        spawnDsh: () => { spawns += 1; return 5000 + spawns },
+        runHook: async () => ({ ran: false }),
+        isProcessAlive: () => false,
+        superviseAttempts: 3,
+        sleep: async () => {},
+        now: (() => { let t = 0; return () => (t += 60000) })(),
+      },
+    })
+    assert.equal(spawns, 3, 'every attempt must be tried')
+    assert.equal(result.supervised, false)
+    assert.match(lines.join('\n'), /giving up|exit/i)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise stands down when another supervisor is already alive', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup3-'))
+  try {
+    const lines = []
+    writePid(path.join(dir, 'supervise.pid'), 999)
+    const result = await runSupervise({
+      config: baseConfig(),
+      configPath: path.join(dir, 'config.json'),
+      log: (line) => lines.push(line),
+      deps: {
+        isProcessAlive: (pid) => pid === 999,
+        spawnDsh: () => { throw new Error('must not spawn a second supervisor') },
+      },
+    })
+    assert.deepEqual(result, { supervised: false, reason: 'already-running' })
+    assert.match(lines.join('\n'), /already running/)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
