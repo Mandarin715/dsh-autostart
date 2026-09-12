@@ -337,9 +337,9 @@ class=CASCADIA_HOSTING_WINDOW_CLASS  title='C:\Program Files\nodejs\node.exe'
 
 - 登录路径(`service.log`,UTC;本地 = +8):
   ```
-  [14:26:13.295Z] supervisor pid=23440 watching 3080
-  [14:26:13.304Z] spawned dsh pid=29520
-  [14:26:34.403Z] port 3080 is up
+  [2026-09-12T14:26:13.295Z] supervisor pid=23440 watching 3080
+  [2026-09-12T14:26:13.304Z] spawned dsh pid=29520
+  [2026-09-12T14:26:34.403Z] port 3080 is up
   ```
   ⇒ 看护进程启动 → 9 毫秒后 attached 启动 DSH → **21.1 秒**端口就绪;在 `startTimeoutMs = 30000` 之内,
   故**无 `WARN`、无重试、无 `giving up`**。
@@ -356,11 +356,11 @@ class=CASCADIA_HOSTING_WINDOW_CLASS  title='C:\Program Files\nodejs\node.exe'
 - `restart.request` **已被消费(文件消失)**;`supervise.stop` **仍在**(23440)⇒ 按设计跨重启保留。
 - `service.log` 序列:
   ```
-  [14:31:48.389Z] restart requested for pid=29520; starting a replacement
-  [14:31:48.389Z] supervisor pid=23440 watching 3080
-  [14:31:48.389Z] takeover: pid 29520 must be gone before we start
-  [14:31:48.392Z] spawned dsh pid=12604
-  [14:32:01.949Z] port 3080 is up
+  [2026-09-12T14:31:48.389Z] restart requested for pid=29520; starting a replacement
+  [2026-09-12T14:31:48.389Z] supervisor pid=23440 watching 3080
+  [2026-09-12T14:31:48.389Z] takeover: pid 29520 must be gone before we start
+  [2026-09-12T14:31:48.392Z] spawned dsh pid=12604
+  [2026-09-12T14:32:01.949Z] port 3080 is up
   ```
   (第二行来自重入启动的同进程再记录,属实。)
 - **关键**:日志中**没有** `stop requested; supervisor exiting`,**也没有** `replacement did not come up`
@@ -385,10 +385,10 @@ class=CASCADIA_HOSTING_WINDOW_CLASS  title='C:\Program Files\nodejs\node.exe'
 - 新看护进程 **30120**(22:38:08),其父进程 = **`WmiPrvSE`** ⇒ **确系经 WMI 中继拉起**(按需接管路径,非登录脚本)。
 - `service.log`:
   ```
-  [14:38:08.643Z] supervisor pid=30120 watching 3080
-  [14:38:08.644Z] takeover: pid 19752 must be gone before we start
-  [14:38:09.907Z] spawned dsh pid=27244
-  [14:38:14.679Z] port 3080 is up
+  [2026-09-12T14:38:08.643Z] supervisor pid=30120 watching 3080
+  [2026-09-12T14:38:08.644Z] takeover: pid 19752 must be gone before we start
+  [2026-09-12T14:38:09.907Z] spawned dsh pid=27244
+  [2026-09-12T14:38:14.679Z] port 3080 is up
   ```
   其中 **19752 = 那台手动启动、被接管的 DSH**;新 DSH **27244** 的父进程 = 30120。
 - **窗口**:命令前 23 → 等 4 秒后 23,**新增 0**。桌面上当时存在 2 个控制台类窗口
@@ -399,7 +399,7 @@ class=CASCADIA_HOSTING_WINDOW_CLASS  title='C:\Program Files\nodejs\node.exe'
 
 - **正常关闭 DSH 时看护进程消费 `supervise.stop` 并自行退出**:真机未观测到 `stop requested; supervisor exiting`
   这一行 —— 当时那次是把看护进程直接结束的,而非让它看到子进程的普通退出。**该路径目前只有单元测试覆盖。**
-- **遗留纸条**:`restart.request` 仍写着被接管的目标 `19752`(看护进程只认自己子进程的编号 ⇒ **永不被消费**);
+- **遗留纸条**:`restart.request` 里是**判据 4 那次**写下的目标 `19752`(判据 2 那条已被消费;这条的编号不属于任何当前子进程 ⇒ **永不被消费**);
   `supervise.stop` 仍写着旧看护进程 `23440`(与新看护进程 30120 不匹配 ⇒ **惰性**)。两者都是"陈旧文件由 pid 比对消解"
   的实证,但确实留了文件。
 - **冷启动慢于 30 秒的机器**:首次等待会超时,此时 `isAlive(pid)` 为真 ⇒ 走"不重复启动"分支并放弃看护
