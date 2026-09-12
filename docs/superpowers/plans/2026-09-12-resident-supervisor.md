@@ -19,7 +19,8 @@
 - **失败方向**:凡是"新实例能否起来"的路径,失败必须**留在可诊断、可恢复**的状态,不得静默变砖。
 - **`config.json` 结构不变**;`schemaVersion` 仍为 `1`。
 - **PowerShell 5.1 陷阱**(本项目已踩过):`.ps1` 含非 ASCII 必须带 BOM 或改纯 ASCII;`$var:` 在双引号字符串里要写 `${var}`;禁止用"会出现在自己命令行里的字面量"去匹配进程。
-- **提交**:一律用 `git commit -F <文件>`,不要用 `-m`(PS 5.1 会传坏内嵌引号)。
+- **提交**:一律用 `git commit -F <文件>`,不要用 `-m`(PS 5.1 会传坏内嵌引号)。**而且写那个信息文件时不要用 `Set-Content -Encoding utf8`** —— PS 5.1 会写入 UTF-8 BOM,提交标题会以不可见字符开头。用 `[System.IO.File]::WriteAllText($path, $msg, (New-Object System.Text.UTF8Encoding($false)))`。
+  *这条已连害两人*(Task 1 与 Task 2 各一次),两次都靠 `git log --pretty=%s` 看首字符码点才发现;发现后用 `git commit --amend -F <BOM-free 文件>` 修,树保持不变。
 
 ---
 
