@@ -345,9 +345,12 @@ test('spawnDsh re-asserts the DSH_HOME captured at enable time', () => {
     })
     assert.equal(captured.options.env.DSH_HOME, 'C:\\custom home')
     assert.equal(captured.options.env.PATH, 'C:\\WINDOWS', 'the rest of the environment is preserved')
-    // Still launched detached and windowless: unchanged by this fix.
-    assert.equal(captured.options.detached, true)
-    assert.equal(captured.options.windowsHide, true)
+    // Attached on purpose: DETACHED_PROCESS leaves the host with no console, and DSH's
+    // sandboxed children cannot be given their own hidden console, so each of them would
+    // create a new one and Windows 11 would hand it to Windows Terminal (one window per
+    // command). Inheriting the supervisor's hidden console is what removes those windows.
+    assert.equal(captured.options.detached, false)
+    assert.equal(captured.options.windowsHide, false)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

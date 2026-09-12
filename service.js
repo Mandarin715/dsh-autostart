@@ -59,7 +59,22 @@ export function dshEnv(config, base = process.env) {
   return { ...base, DSH_HOME: home }
 }
 
-/** Launch DSH detached, with stdout/stderr appended to the log files. */
+/**
+ * Launch DSH attached to this process's console.
+ *
+ * Both flags are load-bearing and were measured, not guessed. `detached: true` is
+ * DETACHED_PROCESS, which leaves the host with no console; `windowsHide: true` is
+ * CREATE_NO_WINDOW, which does not set a console handle either. DSH's sandbox cannot give
+ * its tool subprocesses their own hidden console under the restricted token
+ * (dsh-sandbox-windows-acl: CREATE_NO_WINDOW children die with STATUS_DLL_INIT_FAILED), so
+ * they must share the host's — and with no host console each of them created a fresh one
+ * that Windows 11 handed to Windows Terminal: one visible window per command (F9).
+ *
+ * Clearing either flag makes the child die with its parent instead (measured: an attached
+ * child of a WMI-created parent is gone within ~10s of that parent exiting), so this
+ * function may only be called by a process that stays alive for DSH's whole lifetime —
+ * the supervisor.
+ */
 export function spawnDsh(config, log = () => {}, deps = {}) {
   // parseConfigFile does not validate logPaths (it cannot — it never receives
   // dshHome), so guard it here: an unguarded openSync would throw a TypeError
@@ -70,23 +85,10 @@ export function spawnDsh(config, log = () => {}, deps = {}) {
   const out = fs.openSync(config.logPaths.out, 'a')
   const err = fs.openSync(config.logPaths.err, 'a')
   const spawnImpl = deps.spawn ?? spawn
-  // `detached: true` is load-bearing and must NOT be cleared to chase the console-window
-  // problem: measured 2026-09-12, an attached child of the WMI-created restart helper dies
-  // within ~10s of the helper exiting, while the detached child survives (same child
-  // program, same parent shape, windowsHide held constant). Clearing it would turn
-  // "restart" back into "shut down".
-  //
-  // The cost of keeping it is real and documented: DETACHED_PROCESS leaves this host with
-  // no console, DSH's sandboxed tool subprocesses cannot be given their own hidden console
-  // (dsh-sandbox-windows-acl: CREATE_NO_WINDOW children die with STATUS_DLL_INIT_FAILED
-  // under the restricted token) and must share the host console, so each of them creates a
-  // fresh one and Windows 11 hands it to Windows Terminal: one visible window per command.
-  // Fixing that needs a launcher that both survives the helper's exit and owns a hidden
-  // console; see docs/ACCEPTANCE.md, "console inheritance".
   const child = spawnImpl(config.command.execPath, config.command.argv, {
     cwd: config.command.cwd,
-    detached: true,
-    windowsHide: true,
+    detached: false,
+    windowsHide: false,
     stdio: ['ignore', out, err],
     env: dshEnv(config, deps.baseEnv ?? process.env),
   })
