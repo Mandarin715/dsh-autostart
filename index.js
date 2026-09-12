@@ -71,6 +71,18 @@ const DEFAULT_LAUNCHER_STDERR_TAIL = 2000
 /** Longest diagnostic sentence passed on to the user. */
 const LAUNCH_DETAIL_MAX = 200
 
+/**
+ * Upper bound on the exit delay a restart may schedule.
+ *
+ * The delay exists only to let the 202 response flush before this process exits. It must stay
+ * well inside the window a freshly started supervisor waits for this pid to exit:
+ * DEFAULT_TAKEOVER_EXIT_MS = 30000 in service.js. Past that window the supervisor concludes the
+ * takeover is not happening, stands down, and the restart becomes a shutdown. Clamped at the
+ * use site rather than in lib/config.js, so an existing config.json with a larger value still
+ * loads (and README's advertised knob still exists).
+ */
+const MAX_EXIT_DELAY_MS = 5000
+
 const messageOf = (error) => (error instanceof Error ? error.message : String(error))
 
 /**
@@ -337,6 +349,9 @@ export function createHandlers(deps) {
   const isProcessAliveImpl = deps.isProcessAlive ?? isProcessAlive
   const writeSuperviseStopImpl = deps.writeSuperviseStop ?? writeSuperviseStop
   const writeRestartRequestImpl = deps.writeRestartRequest ?? writeRestartRequest
+  // The read-back needs its own seam for the same reason the write does: there is no injectable
+  // "did it land" anywhere, and writePid cannot report a failure.
+  const readRestartRequestImpl = deps.readRestartRequest ?? readPid
   // The supervisor is one per dsh home. Its pid-wait seams live in a bag of their own so a test
   // can make the launch wait deterministic without spelling out every unrelated handler seam.
   const supervisor =
@@ -483,28 +498,59 @@ export function createHandlers(deps) {
         // goes away. If no supervisor can be started, the catch below refuses with 500 and the
         // host stays up — an exit with nobody to restart us is exactly the failure this design
         // exists to remove.
+        //
+        // Assumes one DSH per dshHome and that a live supervisor is watching THIS child. A
+        // supervisor watching a different child cannot be told apart from ours here: start()
+        // would read that already-live pid and report success. The request below names this
+        // process, and a supervisor honours a request only for the child it saw exit, so the
+        // deeper case is a known limit of this check rather than something it can fix.
         if (!supervisor.isAlive()) {
           // Bounded inside (10s): it throws rather than waiting forever, and the launcher it
           // runs is awaited on purpose — the relay runs inside DSH's job, so it has to finish
           // handing the supervisor out of that job BEFORE the exit that would kill it.
           await supervisor.start(selfPid)
         }
-        // Only now, with a live supervisor confirmed, is the request written. It names THIS
-        // process: the supervisor honours a request only for the child it just saw exit, and
-        // that child is this pid. Same path source as the supervisor's own derivation, so the
-        // request cannot land in a file nobody watches (lib/config.js restartRequestFile).
-        writeRestartRequestImpl(restartRequestFile(dshHome), selfPid)
       } catch (error) {
-        // Covers both a supervisor that could not be started (including one whose pid never
-        // appeared) and a request that could not be written: in either case nothing will take
-        // over, so the host must stay up and the user must be able to retry.
+        // Clear the flag so the user can retry: nothing was started, and the host is still
+        // alive to serve the next request.
         restarting = false
         send(res, 500, { error: `could not start the supervisor: ${messageOf(error)}` })
         return
       }
+      try {
+        // Only now, with a live supervisor confirmed, is the request written. It names THIS
+        // process: the supervisor honours a request only for the child it just saw exit, and
+        // that child is this pid. Same path source as the supervisor's own derivation, so the
+        // request cannot land in a file nobody watches (lib/config.js restartRequestFile).
+        const requestFile = restartRequestFile(dshHome)
+        writeRestartRequestImpl(requestFile, selfPid)
+        // Read it back. writeRestartRequest is writePid, which wraps fs.writeFileSync in a bare
+        // catch ("best effort: a failure here must never take the caller down"), so the write
+        // CANNOT report a failure itself. Without this check a failed write still answers 202
+        // and exits, and the supervisor — finding no request naming the child it just saw exit
+        // — logs "exited without a restart request; nothing to do" and stands down: DSH stays
+        // down. That is the exact failure this whole design exists to remove.
+        if (readRestartRequestImpl(requestFile) !== selfPid) {
+          throw new Error(
+            `the request naming pid ${selfPid} was not confirmed on disk at ${requestFile}`,
+          )
+        }
+      } catch (error) {
+        // Its own label, deliberately not "could not start the supervisor": the supervisor did
+        // start, and client.js renders this text — pointing the user at the WMI/launcher path
+        // here would misdirect the diagnosis.
+        restarting = false
+        send(res, 500, { error: `could not write the restart request: ${messageOf(error)}` })
+        return
+      }
       send(res, 202, { accepted: true, runningAgents: running })
       const scheduleExit = deps.scheduleExit ?? ((fn, ms) => setTimeout(fn, ms))
-      scheduleExit(() => process.exit(0), pluginConfig.exitDelayMs)
+      // Clamped at the use site, not in lib/config.js, so an existing config.json with a larger
+      // value still loads. The delay only exists to let the 202 flush before this process exits,
+      // and it must stay well inside the window a freshly started supervisor waits for this pid
+      // to exit (DEFAULT_TAKEOVER_EXIT_MS = 30000 in service.js). A delay past that window makes
+      // the takeover give up and stand down, i.e. a restart would become a shutdown.
+      scheduleExit(() => process.exit(0), Math.min(pluginConfig.exitDelayMs, MAX_EXIT_DELAY_MS))
     },
   }
 }

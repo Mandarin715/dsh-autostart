@@ -306,6 +306,11 @@ test('disable removes only our own registry entry', async () => {
   const handlers = createHandlers({
     platform: 'win32',
     dshHome: 'C:\\dsh',
+    // disable now also asks the supervisor to stop. This test is about the registry entry, so
+    // the pid read is doubled: without it the stop check reads the literal
+    // C:\dsh\dsh-autostart\supervise.pid on the real filesystem (a silent ENOENT — the same
+    // hermeticity class the write side was fixed for).
+    readPid: () => null,
     registry: {
       readRunValue: () => 'wscript.exe "C:\\dsh\\dsh-autostart\\bootstrap.vbs"',
       removeRunValue: () => removed.push('removed'),
@@ -341,8 +346,14 @@ test('disable leaves a foreign registry entry alone', async () => {
  * Handler deps for the restart route: config.json reports present and every dangerous seam is
  * doubled. `spawnHelper` throws, so a test that reaches it proves a seam it expected to be
  * used was not.
+ *
+ * `writeRestartRequest`/`readRestartRequest` are a matched in-memory restart.request: the write
+ * records the pid, the read-back returns it. Without the pair the route would write, and read
+ * back, the literal `C:\dsh\...` path on the real filesystem — writePid swallows the ENOENT, so
+ * the read-back would then (correctly) refuse and the test would pass or fail by accident.
  */
 function restartRouteDeps(overrides = {}) {
+  let requestOnDisk = null
   return {
     platform: 'win32',
     dshHome: HOME,
@@ -351,6 +362,10 @@ function restartRouteDeps(overrides = {}) {
       throw new Error('must not launch a real helper in this test')
     },
     scheduleExit: () => {},
+    writeRestartRequest: (file, pid) => {
+      requestOnDisk = pid
+    },
+    readRestartRequest: () => requestOnDisk,
     ...overrides,
   }
 }
@@ -383,6 +398,7 @@ test('restart refuses and stays alive when no supervisor can be started', async 
 
 test('restart writes a request naming this process and only then arms the exit', async () => {
   const order = []
+  let requestOnDisk = null
   const handlers = createHandlers(
     restartRouteDeps({
       currentPid: 4321,
@@ -392,7 +408,11 @@ test('restart writes a request naming this process and only then arms the exit',
           order.push('start')
         },
       },
-      writeRestartRequest: (file, pid) => order.push(['request', file, pid]),
+      writeRestartRequest: (file, pid) => {
+        requestOnDisk = pid
+        order.push(['request', file, pid])
+      },
+      readRestartRequest: () => requestOnDisk,
       scheduleExit: () => order.push('exit'),
     }),
   )
@@ -422,13 +442,104 @@ test('restart starts a supervisor that is not alive, naming this process as the 
   assert.deepEqual(started, [4321], 'the supervisor is told which DSH it must take over from')
 })
 
+test('restart refuses and stays up when the handover signal is not on disk', async () => {
+  // The write cannot report failure: writeRestartRequest is writePid, which wraps
+  // fs.writeFileSync in a bare catch ("best effort: a failure here must never take the caller
+  // down"). So a 202 here would mean this host exits while the supervisor, finding no request
+  // naming the child it just saw exit, logs "exited without a restart request; nothing to do"
+  // and stands down — DSH stays down. The read-back is what makes the signal verified.
+  const exits = []
+  let attempts = 0
+  let requestOnDisk = null
+  const handlers = createHandlers(
+    restartRouteDeps({
+      currentPid: 4321,
+      supervisor: { isAlive: () => true, start: async () => {} },
+      // The first write lands nowhere, exactly as a failed writeFileSync would (and the closed
+      // writePid would swallow). The read-back is an explicit null, not a read of a literal
+      // path that happens not to exist on this machine.
+      writeRestartRequest: () => {
+        attempts += 1
+        if (attempts > 1) requestOnDisk = 4321
+      },
+      readRestartRequest: () => requestOnDisk,
+      scheduleExit: (fn) => exits.push(fn),
+    }),
+  )
+  const first = fakeRes()
+  await handlers.restart(fakeReq(), first)
+  assert.equal(first.statusCode, 500)
+  // Its own label: this failure is not a launcher failure, and client.js renders the text.
+  assert.match(first.body, /could not write the restart request/)
+  assert.doesNotMatch(first.body, /could not start the supervisor/)
+  assert.deepEqual(exits, [], 'nothing may exit while the handover signal is missing')
+  const second = fakeRes()
+  await handlers.restart(fakeReq(), second)
+  assert.equal(second.statusCode, 202, 'a failed handover must not lock the button forever')
+  assert.equal(exits.length, 1, 'the retry that wrote a confirmed request may arm the exit')
+})
+
+test('restart writes a real request file that the read-back confirms', async () => {
+  // The read-back must agree with the REAL writer and the REAL path derivation, not only with a
+  // test double: this runs the default write against a temp home and reads it back from
+  // restartRequestFile(home).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-request-'))
+  try {
+    fs.mkdirSync(configDir(dir), { recursive: true })
+    const handlers = createHandlers({
+      platform: 'win32',
+      dshHome: dir,
+      fs: { existsSync: () => true },
+      currentPid: SUPERVISOR_PID,
+      supervisor: { isAlive: () => true, start: async () => {} },
+      scheduleExit: () => {},
+    })
+    const res = fakeRes()
+    await handlers.restart(fakeReq(), res)
+    assert.equal(res.statusCode, 202)
+    assert.equal(
+      readPid(restartRequestFile(dir)),
+      SUPERVISOR_PID,
+      'the real write must satisfy the real read-back',
+    )
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('the scheduled exit delay is clamped below the supervisor takeover window', async () => {
+  const delays = []
+  const run = async (exitDelayMs) => {
+    const handlers = createHandlers(
+      restartRouteDeps({
+        config: { exitDelayMs },
+        currentPid: 4321,
+        supervisor: { isAlive: () => true, start: async () => {} },
+        scheduleExit: (fn, ms) => delays.push(ms),
+      }),
+    )
+    const res = fakeRes()
+    await handlers.restart(fakeReq(), res)
+    assert.equal(res.statusCode, 202)
+  }
+  // A freshly started supervisor waits only DEFAULT_TAKEOVER_EXIT_MS (service.js, 30s) for this
+  // pid to exit. A user-set delay past that window makes the takeover give up and stand down,
+  // which turns a restart into a shutdown.
+  await run(60000)
+  assert.deepEqual(delays, [5000], 'a delay above the cap must be clamped')
+  assert.ok(delays[0] < 30000, 'the clamp must stay inside the supervisor takeover window')
+  await run(200)
+  assert.deepEqual(delays, [5000, 200], 'a delay below the cap is honoured as configured')
+})
+
 test('the three state files are derived from the directory config.json lives in', () => {
   // R2, the silent failure this pins down: the supervisor computes its three files as
   // path.dirname(configPath) from the --config path it is handed. If the route's idea of that
   // directory drifts, restart.request lands in a file nobody watches and the restart simply
-  // never happens — no error anywhere.
+  // never happens — no error anywhere. The cross-file agreement (the route's request path vs
+  // the config path the launcher is handed) is pinned in host-restart.test.js's custom-home
+  // test, where both values come from the production code.
   const dir = path.dirname(configFilePath(HOME))
-  assert.equal(dir, configDir(HOME))
   assert.equal(restartRequestFile(HOME), path.join(dir, 'restart.request'))
   assert.equal(supervisePidFile(HOME), path.join(dir, 'supervise.pid'))
   assert.equal(superviseStopFile(HOME), path.join(dir, 'supervise.stop'))

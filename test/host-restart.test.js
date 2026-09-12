@@ -44,6 +44,11 @@ const req = () => ({
  */
 function restartDeps(overrides = {}) {
   let pidReads = 0
+  // A matched in-memory restart.request: the write records the pid, the read-back returns it.
+  // Without the pair the route would write, and read back, the literal `C:\dsh\...` path on the
+  // real filesystem — writePid swallows the ENOENT, so the read-back would then (correctly)
+  // refuse and every test on this path would pass or fail by accident.
+  let requestOnDisk = null
   return {
     platform: 'win32',
     dshHome: 'C:\\dsh',
@@ -53,6 +58,10 @@ function restartDeps(overrides = {}) {
     fs: { existsSync: () => true },
     spawnHelper: () => {},
     scheduleExit: () => {},
+    writeRestartRequest: (file, pid) => {
+      requestOnDisk = pid
+    },
+    readRestartRequest: () => requestOnDisk,
     supervise: {
       readPid: () => (pidReads++ === 0 ? null : 4321),
       isAlive: () => true,
@@ -447,12 +456,19 @@ test('restart passes the host-resolved config path to the helper', async () => {
   // Derived from the resolved dshHome (which deps can override), never from
   // DSH_HOME — the helper is created across a boundary that drops the env.
   let seen = null
+  let requestFile = null
+  let requestPid = null
   const handlers = createHandlers(
     restartDeps({
       dshHome: 'C:\\custom home',
       spawnHelper: (input) => {
         seen = input
       },
+      writeRestartRequest: (file, pid) => {
+        requestFile = file
+        requestPid = pid
+      },
+      readRestartRequest: () => requestPid,
       scheduleExit: () => {},
     }),
   )
@@ -460,6 +476,13 @@ test('restart passes the host-resolved config path to the helper', async () => {
   await handlers.restart(req(), res)
   assert.equal(res.statusCode, 202)
   assert.equal(seen.configPath, 'C:\\custom home\\dsh-autostart\\config.json')
+  // Minor 9: the two path sources must agree. The supervisor derives its three state files from
+  // path.dirname(configPath) of the path the launcher is handed; the route derives the request
+  // path itself. Assert the route's path against the supervisor's derivation of the path it was
+  // actually handed — not each against a literal, which is what made the earlier assertion
+  // tautological.
+  assert.equal(requestFile, path.join(path.dirname(seen.configPath), 'restart.request'))
+  assert.equal(requestPid, process.pid, 'the request names this process when deps.currentPid is absent')
 })
 
 test('the launch input the restart route builds satisfies buildHelperCommandLine', async () => {
