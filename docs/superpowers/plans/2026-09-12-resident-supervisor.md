@@ -102,7 +102,13 @@ Start-Sleep -Seconds 5
 Get-Content "$env:USERPROFILE\.dsh\logs\spike-console-inherit.log" -Encoding UTF8
 ```
 
-Expected: 日志出现 `child=<pid> self=<pid>`。
+Expected: 进程树里出现 `powershell`(spawner)+ 一个 attached 的 `node`(子进程),而**控制台窗口不可见**。
+
+> ⚠️ **实测修正(2026-09-12)**:**不要**等日志里出现 `child=<pid> self=<pid>` 才开始 Step 5。
+> 启动器那行 `(& $node $js … | Out-String)` 会**缓冲到 node 进程退出**(本例 300 秒),所以
+> `child=` 要到 t≈300s 才落盘。照 Step 5 原本的写法从日志正则取 pid 会得到 `child=0`,
+> 于是 10 行全是 `DEAD` —— 一个**假 FAIL**。pid 从**进程树**取(见 Step 5),日志那行等它
+> 出现后再用于**交叉校验**。
 
 - [ ] **Step 4: 睡 3 秒后枚举可见控制台窗口(判据:必须为空)**
 
@@ -137,15 +143,28 @@ Expected: `PASS: 没有可见控制台窗口`。
 - [ ] **Step 5: 观察 attached 子进程 5 分钟(判据:全程存活)**
 
 ```powershell
-$log = Get-Content "$env:USERPROFILE\.dsh\logs\spike-console-inherit.log" -Encoding UTF8
-$child = [int]([regex]::Match(($log -join "`n"), 'child=(\d+)').Groups[1].Value)
-"watch child=$child"
+# pid 从进程树取,不要从日志正则取 —— 见 Step 3 的实测修正(那行日志会被缓冲到 node 退出)。
+$spawner = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+  Where-Object { $_.CommandLine -match 'spike-console-inherit\.ps1' }
+$self = (Get-CimInstance Win32_Process -Filter "ParentProcessId=$($spawner.ProcessId)" |
+  Where-Object { $_.Name -eq 'node.exe' }).ProcessId
+$child = (Get-CimInstance Win32_Process -Filter "ParentProcessId=$self" |
+  Where-Object { $_.Name -eq 'node.exe' }).ProcessId
+"watch child=$child (parent=$self)"
 1..10 | ForEach-Object {
-  $p = Get-Process -Id $child -ErrorAction SilentlyContinue
-  "$(Get-Date -Format HH:mm:ss)  $child = $(if ($p) { 'alive' } else { 'DEAD' })"
+  $c = Get-Process -Id $child -ErrorAction SilentlyContinue
+  $p = Get-Process -Id $self  -ErrorAction SilentlyContinue
+  "$(Get-Date -Format HH:mm:ss)  child=$child=$(if ($c) { 'alive' } else { 'DEAD' })  parent=$self=$(if ($p) { 'alive' } else { 'DEAD' })"
   Start-Sleep -Seconds 30
 }
+# 交叉校验:等启动器退出后,日志里应当出现同一对 pid。
+Start-Sleep -Seconds 20
+Get-Content "$env:USERPROFILE\.dsh\logs\spike-console-inherit.log" -Encoding UTF8
 ```
+
+> 上面那段 `Where-Object … -match 'spike-console-inherit'` 只用于**筛选探针进程**,而本命令自身
+> 不会把这个字面量写进任何**进程命令行**(它只出现在脚本文件里)—— 这一点必须守住,项目里
+> 已经因为"用自己的命令行字面量杀进程"误杀过 agent 自己的 runner。
 
 Expected: 10 行全是 `alive`(5 分钟)。若中途 `DEAD`,**前提不成立,停止本计划**。
 
