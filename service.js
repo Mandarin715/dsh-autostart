@@ -32,15 +32,6 @@ const SERVICE_JS = fileURLToPath(import.meta.url)
 const DEFAULT_PORT_PROBE_WINDOW_MS = 3000
 const DEFAULT_PORT_PROBE_INTERVAL_MS = 250
 
-// How long the single last-resort attempt waits before trying again (see
-// scheduleSecondChance). Long enough for a slow first start, a busy antivirus scan or a
-// port that is still draining to clear; short enough that a user staring at a dead page
-// does not give up first.
-const DEFAULT_SECOND_CHANCE_DELAY_MS = 60000
-
-// Upper bound for --delay, so a mistyped value cannot park a process for days.
-const MAX_DELAY_MS = 24 * 60 * 60 * 1000
-
 // How long `supervise --takeover <pid>` waits for that DSH to exit before concluding it is
 // not going to. See runSupervise: without the takeover shape an on-demand supervisor would
 // see a busy port, stand down, and leave nobody to restart DSH when the old one exits.
@@ -429,43 +420,12 @@ async function superviseChild(input) {
 }
 
 /**
- * The last-resort fallback: one more start attempt, later, from a process that outlives the
- * helper.
- *
- * This exists because a failed restart takes DSH down and no in-page UI can report it — the
- * card is part of the page that just disappeared. The child is detached so it survives the
- * helper (and DSH's job), runs `service.js start` again after a delay, and is marked
- * `--second-chance` so it can never schedule another one: exactly one extra attempt, never a
- * loop. It is also idempotent — runStart probes the port first — so it does nothing when
- * DSH came back on its own, or when something else owns the port.
- */
-export function scheduleSecondChance(input) {
-  const { configPath, log } = input
-  const deps = input.deps ?? {}
-  const spawnImpl = deps.spawn ?? spawn
-  const delayMs = deps.secondChanceDelayMs ?? DEFAULT_SECOND_CHANCE_DELAY_MS
-  try {
-    const child = spawnImpl(
-      process.execPath,
-      [SERVICE_JS, 'start', '--config', configPath, '--second-chance', '--delay', String(delayMs)],
-      { detached: true, windowsHide: true, stdio: 'ignore' },
-    )
-    child.unref()
-    log(`scheduled one more start attempt in ${delayMs}ms (pid=${child.pid})`)
-    return child.pid
-  } catch (error) {
-    log(`could not schedule the fallback start attempt: ${error instanceof Error ? error.message : String(error)}`)
-    return null
-  }
-}
-
-/**
  * Whether a pid is still alive on this OS.
  *
  * Only ESRCH means "gone". Any other error — notably EPERM, for a live process
- * this user may not signal — must report ALIVE: a false "gone" would skip
- * runRestart's abort and spawn a second instance while the old one may still
- * hold the port, which is the exact failure mode this path exists to avoid.
+ * this user may not signal — must report ALIVE: a false "gone" would let the
+ * supervisor start a second instance while the old one may still hold the port,
+ * which is the exact failure mode the takeover wait exists to avoid.
  * The `kill` seam exists so this is testable without touching a real process.
  */
 export function defaultIsAlive(pid, kill = (target, signal) => process.kill(target, signal)) {
@@ -493,31 +453,6 @@ export async function waitForProcessExit(pid, options = {}) {
   }
 }
 
-/**
- * Full restart: wait for the old process to exit, then start DSH again.
- * Aborting (rather than starting a second instance) is the safe failure mode.
- */
-export async function runRestart(input) {
-  const { config, oldPid, log } = input
-  const deps = input.deps ?? {}
-  const waitExit = deps.waitForProcessExit ?? waitForProcessExit
-  const exited = await waitExit(oldPid, { timeoutMs: config.waitForExitMs })
-  if (!exited) {
-    log(`WARN old process ${oldPid} still alive after ${config.waitForExitMs}ms; aborting restart`)
-    return { restarted: false }
-  }
-  log(`old process ${oldPid} exited; starting a new instance`)
-  const started = await runStart({
-    config,
-    log,
-    deps,
-    configPath: input.configPath,
-    secondChance: input.secondChance,
-    afterRestart: true,
-  })
-  return { restarted: true, ...started }
-}
-
 /** Log to service.log, creating the directory first. */
 function makeLogger(config) {
   const target = config?.logPaths?.service
@@ -540,23 +475,13 @@ export async function main(argv, deps = {}) {
   const configFlag = argv.indexOf('--config')
   const named = configFlag === -1 ? null : argv[configFlag + 1]
   if (configFlag !== -1 && (typeof named !== 'string' || named === '' || named.startsWith('-'))) {
-    // Present but unusable — including the `--config --pid 5` slip, where the
+    // Present but unusable — including the `--config --takeover 5` slip, where the
     // next flag would otherwise be read as a path. Falling back silently would
     // reintroduce exactly the wrong-home failure this flag exists to prevent, so
     // refuse instead.
     return 2
   }
   const configPath = deps.configPath ?? named ?? configFilePath(resolveDshHome())
-  // `--second-chance` marks the single fallback attempt scheduleSecondChance creates. It is
-  // forbidden from creating another, so a permanent failure cannot become a retry loop.
-  const secondChance = argv.includes('--second-chance')
-  // `--delay <ms>` lets that fallback wait before it runs, without a second script.
-  const delayFlag = argv.indexOf('--delay')
-  const delayRaw = delayFlag === -1 ? null : argv[delayFlag + 1]
-  const delayMs = delayRaw === null ? 0 : Number(delayRaw)
-  if (delayRaw !== null && (!Number.isInteger(delayMs) || delayMs < 0 || delayMs > MAX_DELAY_MS)) {
-    return 2
-  }
   let config
   try {
     config = readConfig(configPath)
@@ -585,11 +510,6 @@ export async function main(argv, deps = {}) {
   // process, which is invisible to the user.
   const runSuperviseImpl = deps.runSupervise ?? runSupervise
   try {
-    if (delayMs > 0) {
-      const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
-      log(`waiting ${delayMs}ms before the fallback attempt`)
-      await sleep(delayMs)
-    }
     // `start` is kept as an alias: bootstrap.vbs is written at enable time and says
     // `service.js start --config …`, so old installs must keep working without the user
     // re-enabling autostart. `supervise` is the real entry point.

@@ -83,7 +83,7 @@ test('buildLauncherArgv asks WMI for a HIDDEN window', () => {
   // lingers); with ProcessStartupInformation.ShowWindow = 0 the console window is
   // created hidden. "No console window at any point" is this plugin's headline
   // promise, so this assertion is load-bearing, not cosmetic.
-  const { args } = buildLauncherArgv('"C:\\node.exe" "C:\\svc.js" restart --pid 7')
+  const { args } = buildLauncherArgv('"C:\\node.exe" "C:\\svc.js" supervise --config "C:\\cfg.json" --takeover 7')
   const script = Buffer.from(args[args.indexOf('-EncodedCommand') + 1], 'base64').toString('utf16le')
   assert.match(script, /Win32_ProcessStartup/)
   assert.match(script, /ShowWindow\s*=\s*0/)
@@ -91,7 +91,7 @@ test('buildLauncherArgv asks WMI for a HIDDEN window', () => {
 })
 
 test('buildLauncherArgv asks the WMI service to create the helper process', () => {
-  const helperLine = '"C:\\node.exe" "C:\\svc.js" restart --pid 7'
+  const helperLine = '"C:\\node.exe" "C:\\svc.js" supervise --config "C:\\cfg.json" --takeover 7'
   const { command, args } = buildLauncherArgv(helperLine)
 
   assert.match(command, /powershell\.exe$/i)
@@ -135,7 +135,7 @@ test('buildLauncherArgv makes a failed WMI create both visible and diagnosable',
   // an XML document instead of a sentence. [Console]::Error.WriteLine bypasses
   // that, and the sentinel pair lets the host find the line even though
   // PowerShell still appends a CLIXML progress blob after it.
-  const { args } = buildLauncherArgv('"C:\\node.exe" "C:\\svc.js" restart --pid 7')
+  const { args } = buildLauncherArgv('"C:\\node.exe" "C:\\svc.js" supervise --config "C:\\cfg.json" --takeover 7')
   const script = Buffer.from(args[args.indexOf('-EncodedCommand') + 1], 'base64').toString('utf16le')
   assert.match(script, /ReturnValue/)
   assert.match(script, /\[Console\]::Error\.WriteLine/)
@@ -147,7 +147,7 @@ test('buildLauncherArgv makes a failed WMI create both visible and diagnosable',
 test('buildLauncherArgv escapes an apostrophe so a path cannot break out of the literal', () => {
   // "O'Brien" is a legal Windows user name; an unescaped quote would end the
   // PowerShell string early and turn the rest of the path into script code.
-  const { args } = buildLauncherArgv(`"C:\\node.exe" "C:\\Users\\O'Brien\\svc.js" restart --pid 7`)
+  const { args } = buildLauncherArgv(`"C:\\node.exe" "C:\\Users\\O'Brien\\svc.js" supervise --config "C:\\cfg.json" --takeover 7`)
   const script = Buffer.from(args[args.indexOf('-EncodedCommand') + 1], 'base64').toString('utf16le')
   assert.match(script, /O''Brien/)
   assert.doesNotMatch(script, /O'Brien/)
