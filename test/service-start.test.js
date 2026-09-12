@@ -175,13 +175,18 @@ test('spawnDsh refuses a config without log paths instead of throwing a raw Type
   )
 })
 
-test('main returns 1 rather than rejecting when the start path throws', async () => {
+test('main returns 1 rather than rejecting when the start path throws', { timeout: 1000 }, async () => {
   // `deps` is what main forwards to the mode implementation, so the injections are nested.
   // The guard is left to run for real over a temp dir, which is what makes the throwing
   // spawnDsh below reachable: with no `supervise.pid` there anotherSupervisorAlive says no, the
   // port probe is injected free, and the spawn is the only thing left to fail. A throwing
   // spawnDsh must surface as exit code 1 — main's contract is to return a code, and an
   // uncaught rejection here would be invisible in a hidden login process.
+  //
+  // The 1000ms budget is the point: this test's safety depends on the nested seam bag
+  // surviving. If `deps.deps` is ever dropped, the real 3s port probe (or a real spawn and the
+  // retry loop bounded by DEFAULT_SUPERVISE_TOTAL_MS) engages, and without a budget that would
+  // hang the file instead of failing one test.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-throw-'))
   try {
     const code = await main(['node', 'service.js', 'start'], {
@@ -314,11 +319,6 @@ test('spawnDsh leaves the environment alone when no dshHome was captured', () =>
   }
 })
 
-// ---------------------------------------------------------------- fallbacks
-// A restart that fails leaves DSH down, and the card lives inside DSH's page, so no UI can
-// report it. The only useful fallbacks are automatic: retry the start, then leave one
-// delayed attempt behind before giving up.
-
 // ---------------------------------------------------------------- supervisor
 
 test('runSupervise starts DSH once and reports that it is supervising', async () => {
@@ -352,6 +352,79 @@ test('runSupervise starts DSH once and reports that it is supervising', async ()
     assert.equal(result.pid, 4242)
     assert.equal(result.child, child)
     assert.equal(result.child.pid, 4242)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise spawns, waits for the port and only then runs the hook', async () => {
+  // Carried from runStart's tests, which the Task 7 deletion removed: the start phase's ORDER
+  // is load-bearing. The hook is the user's post-start script, so it must not run before DSH
+  // was spawned, or before waitForPort said the port is actually up. The test above pins the
+  // counts only, so a reorder would still pass it.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-order-'))
+  try {
+    const order = []
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 1000 }),
+      configPath: path.join(dir, 'config.json'),
+      log: () => {},
+      deps: {
+        isPortListening: async () => false,
+        waitForPort: async () => {
+          order.push('waitForPort')
+          return true
+        },
+        spawnDsh: () => {
+          order.push('spawn')
+          return fakeChild(4242)
+        },
+        runHook: async () => {
+          order.push('hook')
+          return { ran: false }
+        },
+        isProcessAlive: () => false,
+        waitForChildExit: async (pid) => pid,
+        sleep: async () => {},
+      },
+    })
+    assert.deepEqual(order, ['spawn', 'waitForPort', 'hook'])
+    assert.equal(result.supervised, true)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise hands its own log function to the spawner', async () => {
+  // Also carried: service.js:327 calls `spawnImpl(config, log, deps)`, and spawnDsh reports a
+  // spawn 'error' through exactly that function. Hand over a different (or default no-op) log
+  // and a failed launch is invisible in service.log — the user's only diagnostic. Pinned by
+  // identity AND by calling it.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-log-'))
+  try {
+    const lines = []
+    const log = (line) => lines.push(line)
+    let handed = null
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 1000 }),
+      configPath: path.join(dir, 'config.json'),
+      log,
+      deps: {
+        isPortListening: async () => false,
+        waitForPort: async () => true,
+        spawnDsh: (config, spawnLog) => {
+          handed = spawnLog
+          return fakeChild(4242)
+        },
+        runHook: async () => ({ ran: false }),
+        isProcessAlive: () => false,
+        waitForChildExit: async (pid) => pid,
+        sleep: async () => {},
+      },
+    })
+    assert.equal(handed, log, 'the spawner must receive the supervisor log, not a no-op')
+    handed('spawn error: probe')
+    assert.ok(
+      lines.includes('spawn error: probe'),
+      `the handed log must be the one recording, got: ${JSON.stringify(lines)}`,
+    )
+    assert.equal(result.supervised, true)
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
 
