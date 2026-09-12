@@ -179,6 +179,26 @@ this plugin be your only autostart entry.
 **The card lives inside DSH's page — so when DSH is down you cannot open the card.** Recovery therefore has to be
 command-line. Work down this list.
 
+### 0) Wait a minute or two first — the plugin retries on its own
+
+When the replacement instance does not come up, the helper does not simply give up:
+
+1. It **retries the start up to 3 times** (each waits `startTimeoutMs`, 30s by default, with a 3s pause between).
+   It only retries once the failed child is **really gone** — while one is still alive it will not start a competitor
+   for the same port.
+2. If all attempts fail it **schedules one delayed attempt** (60s by default), run by a process that outlives the
+   helper. That attempt is **marked so it can never schedule another**, so this cannot become a retry loop.
+
+So after a failure, **wait 1–2 minutes before intervening by hand**. The helper says what it is doing:
+
+```
+spawned dsh pid=… (attempt 2/3)                       # retrying
+scheduled one more start attempt in 60000ms (pid=…)   # fallback armed
+waiting 60000ms before the fallback attempt           # fallback actually ran
+```
+
+Only if all of that fails, continue below.
+
 ### 1) Read the logs first
 
 ```

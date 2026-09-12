@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { runStart, runHook, spawnDsh, main } from '../service.js'
+import { runStart, runHook, spawnDsh, scheduleSecondChance, main } from '../service.js'
 
 function baseConfig(overrides = {}) {
   return {
@@ -25,6 +25,7 @@ test('runStart skips when the port is already listening', async () => {
     log: (line) => lines.push(line),
     deps: {
       isPortListening: async () => true,
+      portProbeWindowMs: 0,
       waitForPort: async () => true,
       spawnDsh: () => {
         throw new Error('must not spawn')
@@ -33,7 +34,67 @@ test('runStart skips when the port is already listening', async () => {
     },
   })
   assert.deepEqual(result, { started: false })
-  assert.match(lines.join('\n'), /already running/)
+  assert.match(lines.join('\n'), /still answering/)
+})
+
+test('runStart retries the port probe so an early answer cannot abort the restart', async () => {
+  // Measured 2026-09-12 (docs/ACCEPTANCE.md, "restart race"): the outcome turns on a few
+  // milliseconds after the old host is confirmed gone. One run probed at +4ms, read the port
+  // as occupied, and returned without starting anything -- DSH stayed down; two later runs
+  // probed at +10ms and +9ms, read it as free, and restarted normally. A probe landing the
+  // instant after a process dies can be answered by a socket the kernel has not released
+  // yet, and a plain connect cannot tell that apart from a live foreign service. Hence the
+  // retry, which works without deciding which of the two it was.
+  const answers = [true, true, false]
+  let probes = 0
+  let clock = 0
+  const result = await runStart({
+    config: baseConfig(),
+    log: () => {},
+    deps: {
+      isPortListening: async () => answers[probes++] ?? false,
+      portProbeWindowMs: 5000,
+      portProbeIntervalMs: 1,
+      // Deterministic clock: the deadline must advance without real waiting.
+      now: () => (clock += 100),
+      sleep: async () => {},
+      waitForPort: async () => true,
+      spawnDsh: () => 4242,
+      runHook: async () => ({ ran: false }),
+    },
+  })
+  assert.equal(probes, 3, 'the probe must be retried, not decided on a single sample')
+  assert.deepEqual(result, { started: true, pid: 4242, up: true })
+})
+
+test('runStart still refuses to start a second instance while the port keeps answering', async () => {
+  // The retry above must not weaken the safety property the single probe existed for:
+  // a genuinely foreign listener keeps answering, so the window expires and we do not
+  // start a competing DSH on the same port.
+  const lines = []
+  let probes = 0
+  let clock = 0
+  const result = await runStart({
+    config: baseConfig(),
+    log: (line) => lines.push(line),
+    deps: {
+      isPortListening: async () => {
+        probes += 1
+        return true
+      },
+      portProbeWindowMs: 200,
+      portProbeIntervalMs: 1,
+      now: () => (clock += 100),
+      sleep: async () => {},
+      spawnDsh: () => {
+        throw new Error('must not spawn a second instance')
+      },
+      runHook: async () => ({ ran: false }),
+    },
+  })
+  assert.deepEqual(result, { started: false })
+  assert.ok(probes > 1, `expected more than one probe, got ${probes}`)
+  assert.match(lines.join('\n'), /still answering after \d+ probes/)
 })
 
 test('runStart spawns, waits for the port, then runs the hook', async () => {
@@ -317,4 +378,157 @@ test('spawnDsh leaves the environment alone when no dshHome was captured', () =>
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// ---------------------------------------------------------------- fallbacks
+// A restart that fails leaves DSH down, and the card lives inside DSH's page, so no UI can
+// report it. The only useful fallbacks are automatic: retry the start, then leave one
+// delayed attempt behind before giving up.
+
+test('runStart retries a start that never came up, once the failed child is gone', async () => {
+  const lines = []
+  let spawns = 0
+  const result = await runStart({
+    config: baseConfig(),
+    log: (line) => lines.push(line),
+    deps: {
+      isPortListening: async () => false,
+      waitForPort: async () => false,
+      spawnDsh: () => {
+        spawns += 1
+        return 1000 + spawns
+      },
+      isProcessAlive: () => false,
+      startAttempts: 3,
+      startRetryDelayMs: 0,
+      sleep: async () => {},
+      runHook: async () => ({ ran: false }),
+      scheduleSecondChance: () => 1,
+    },
+  })
+  assert.equal(spawns, 3, 'a failed start must be retried up to the attempt limit')
+  assert.equal(result.up, false)
+  assert.match(lines.join('\n'), /attempt 3\/3/)
+})
+
+test('runStart does not start a competitor while the failed child is still alive', async () => {
+  // A live child may still bind the port a moment later; spawning a second one at that
+  // point is how you get two DSH instances racing for 3080.
+  const lines = []
+  let spawns = 0
+  await runStart({
+    config: baseConfig(),
+    log: (line) => lines.push(line),
+    deps: {
+      isPortListening: async () => false,
+      waitForPort: async () => false,
+      spawnDsh: () => {
+        spawns += 1
+        return 2000
+      },
+      isProcessAlive: () => true,
+      startAttempts: 3,
+      startRetryDelayMs: 0,
+      sleep: async () => {},
+      runHook: async () => ({ ran: false }),
+      scheduleSecondChance: () => 1,
+    },
+  })
+  assert.equal(spawns, 1, 'the live child gets the port wait to itself')
+  assert.match(lines.join('\n'), /still alive/)
+})
+
+test('a failed start leaves exactly one delayed attempt behind', async () => {
+  const scheduled = []
+  await runStart({
+    config: baseConfig(),
+    configPath: 'C:\\home\\.dsh\\dsh-autostart\\config.json',
+    log: () => {},
+    deps: {
+      isPortListening: async () => false,
+      waitForPort: async () => false,
+      spawnDsh: () => 3000,
+      isProcessAlive: () => false,
+      startAttempts: 1,
+      sleep: async () => {},
+      runHook: async () => ({ ran: false }),
+      scheduleSecondChance: (input) => {
+        scheduled.push(input)
+        return 4242
+      },
+    },
+  })
+  assert.equal(scheduled.length, 1)
+  assert.equal(scheduled[0].configPath, 'C:\\home\\.dsh\\dsh-autostart\\config.json')
+})
+
+test('the delayed attempt itself never schedules another one (no loop)', async () => {
+  const scheduled = []
+  await runStart({
+    config: baseConfig(),
+    configPath: 'C:\\home\\.dsh\\dsh-autostart\\config.json',
+    secondChance: true,
+    log: () => {},
+    deps: {
+      isPortListening: async () => false,
+      waitForPort: async () => false,
+      spawnDsh: () => 3000,
+      isProcessAlive: () => false,
+      startAttempts: 1,
+      sleep: async () => {},
+      runHook: async () => ({ ran: false }),
+      scheduleSecondChance: (input) => {
+        scheduled.push(input)
+        return 1
+      },
+    },
+  })
+  assert.deepEqual(scheduled, [], 'the fallback must be a single extra attempt')
+})
+
+test('a port we refused to fight over only gets a fallback after a restart', async () => {
+  // At login a busy port usually means something else is already serving DSH, and a
+  // fallback would be an attempt to fight it. After a restart it means our own instance
+  // just died and something is lingering, which is exactly the case worth retrying.
+  const scheduled = []
+  const deps = {
+    isPortListening: async () => true,
+    portProbeWindowMs: 0,
+    spawnDsh: () => {
+      throw new Error('must not spawn')
+    },
+    runHook: async () => ({ ran: false }),
+    scheduleSecondChance: (input) => {
+      scheduled.push(input)
+      return 1
+    },
+  }
+  await runStart({ config: baseConfig(), configPath: 'cfg.json', log: () => {}, deps })
+  assert.deepEqual(scheduled, [], 'a login-time skip must not schedule a retry')
+
+  await runStart({ config: baseConfig(), configPath: 'cfg.json', afterRestart: true, log: () => {}, deps })
+  assert.equal(scheduled.length, 1, 'a restart-time skip should')
+})
+
+test('scheduleSecondChance spawns one detached, delayed start attempt', () => {
+  let captured = null
+  const lines = []
+  const pid = scheduleSecondChance({
+    configPath: 'C:\\home\\.dsh\\dsh-autostart\\config.json',
+    log: (line) => lines.push(line),
+    deps: {
+      secondChanceDelayMs: 60000,
+      spawn: (command, args, options) => {
+        captured = { command, args, options }
+        return { pid: 777, unref() {} }
+      },
+    },
+  })
+  assert.equal(pid, 777)
+  assert.equal(captured.command, process.execPath)
+  assert.match(captured.args.join(' '), /service\.js start --config/)
+  assert.match(captured.args.join(' '), /--second-chance/)
+  assert.match(captured.args.join(' '), /--delay 60000/)
+  assert.equal(captured.options.detached, true, 'it has to outlive the helper')
+  assert.match(lines.join('\n'), /scheduled one more start attempt/)
 })

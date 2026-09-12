@@ -18,6 +18,26 @@ import { powershellPath } from './lib/launch-helper.js'
 
 const SERVICE_JS = fileURLToPath(import.meta.url)
 
+// How long a port that keeps answering is re-probed before it is called another service's.
+// A port can still answer for an instant after the process that owned it dies, which is what
+// made a single probe unsafe right after a restart (see runStart).
+const DEFAULT_PORT_PROBE_WINDOW_MS = 3000
+const DEFAULT_PORT_PROBE_INTERVAL_MS = 250
+
+// A start that never came up is retried this many times, with this pause, provided the
+// failed child is gone by then (see runStart).
+const DEFAULT_START_ATTEMPTS = 3
+const DEFAULT_START_RETRY_DELAY_MS = 3000
+
+// How long the single last-resort attempt waits before trying again (see
+// scheduleSecondChance). Long enough for a slow first start, a busy antivirus scan or a
+// port that is still draining to clear; short enough that a user staring at a dead page
+// does not give up first.
+const DEFAULT_SECOND_CHANCE_DELAY_MS = 60000
+
+// Upper bound for --delay, so a mistyped value cannot park a process for days.
+const MAX_DELAY_MS = 24 * 60 * 60 * 1000
+
 /** Load and validate config.json. */
 export function readConfig(configPath) {
   const text = fs.readFileSync(configPath, 'utf8')
@@ -50,6 +70,19 @@ export function spawnDsh(config, log = () => {}, deps = {}) {
   const out = fs.openSync(config.logPaths.out, 'a')
   const err = fs.openSync(config.logPaths.err, 'a')
   const spawnImpl = deps.spawn ?? spawn
+  // `detached: true` is load-bearing and must NOT be cleared to chase the console-window
+  // problem: measured 2026-09-12, an attached child of the WMI-created restart helper dies
+  // within ~10s of the helper exiting, while the detached child survives (same child
+  // program, same parent shape, windowsHide held constant). Clearing it would turn
+  // "restart" back into "shut down".
+  //
+  // The cost of keeping it is real and documented: DETACHED_PROCESS leaves this host with
+  // no console, DSH's sandboxed tool subprocesses cannot be given their own hidden console
+  // (dsh-sandbox-windows-acl: CREATE_NO_WINDOW children die with STATUS_DLL_INIT_FAILED
+  // under the restricted token) and must share the host console, so each of them creates a
+  // fresh one and Windows 11 hands it to Windows Terminal: one visible window per command.
+  // Fixing that needs a launcher that both survives the helper's exit and owns a hidden
+  // console; see docs/ACCEPTANCE.md, "console inheritance".
   const child = spawnImpl(config.command.execPath, config.command.argv, {
     cwd: config.command.cwd,
     detached: true,
@@ -141,6 +174,20 @@ export function runHook(config, log, deps = {}) {
 
 /**
  * Start DSH unless the port already answers. Conditional polling only.
+ *
+ * The probe is retried over a bounded window rather than trusted once. Measured
+ * 2026-09-12 (docs/ACCEPTANCE.md, "restart race"): the outcome turns on a few milliseconds
+ * after the old host is confirmed gone. On one run the single probe fired 4ms after the
+ * exit, answered "busy", and the helper logged "skip start" and returned without starting
+ * anything — DSH stayed down and the user saw only "reconnecting". On two later runs of the
+ * same code the probe fired at +10ms and +9ms, answered "free", and the restart worked.
+ *
+ * What answered at +4ms was not captured (the acceptance note records what was and was not
+ * observed); the practical reading is that a probe landing the instant after a process dies
+ * can be answered by a socket the kernel has not released yet, and a plain connect cannot
+ * tell that apart from a live foreign service. Retrying is the fix that does not depend on
+ * knowing which of the two it was: a draining socket clears, while a genuinely foreign
+ * listener keeps answering and the window expires exactly as before.
  */
 export async function runStart(input) {
   const { config, log } = input
@@ -149,17 +196,100 @@ export async function runStart(input) {
   const wait = deps.waitForPort ?? waitForPort
   const spawnImpl = deps.spawnDsh ?? spawnDsh
   const hook = deps.runHook ?? runHook
+  const now = deps.now ?? Date.now
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+  const isAlive = deps.isProcessAlive ?? defaultIsAlive
+  const attempts = deps.startAttempts ?? DEFAULT_START_ATTEMPTS
+  const retryDelayMs = deps.startRetryDelayMs ?? DEFAULT_START_RETRY_DELAY_MS
+  const schedule =
+    deps.scheduleSecondChance ?? (input.configPath ? scheduleSecondChance : null)
 
-  if (await probe(config.dshPort)) {
-    log(`port ${config.dshPort} already running; skip start`)
-    return { started: false }
+  const windowMs = deps.portProbeWindowMs ?? DEFAULT_PORT_PROBE_WINDOW_MS
+  const intervalMs = deps.portProbeIntervalMs ?? DEFAULT_PORT_PROBE_INTERVAL_MS
+  const deadline = now() + windowMs
+  let probes = 0
+  for (;;) {
+    probes += 1
+    if (!(await probe(config.dshPort))) break
+    if (now() >= deadline) {
+      log(
+        `port ${config.dshPort} still answering after ${probes} probes (${windowMs}ms); ` +
+          'assuming another service owns it; skip start',
+      )
+      // A busy port at login usually means something else is already serving DSH, and a
+      // fallback would be an attempt to fight it. After a restart it means our own instance
+      // just died and something is lingering, which is the case worth one more try.
+      if (input.afterRestart && schedule && !input.secondChance) {
+        await schedule({ configPath: input.configPath, config, log, deps })
+      }
+      return { started: false }
+    }
+    await sleep(intervalMs)
   }
-  const pid = spawnImpl(config, log, deps)
-  log(`spawned dsh pid=${pid}`)
-  const up = await wait(config.dshPort, { timeoutMs: config.startTimeoutMs })
-  log(up ? `port ${config.dshPort} is up` : `WARN port ${config.dshPort} did not come up in time`)
-  await hook(config, log, deps)
-  return { started: true, pid, up }
+
+  let pid = null
+  let up = false
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    pid = spawnImpl(config, log, deps)
+    log(`spawned dsh pid=${pid}${attempt > 1 ? ` (attempt ${attempt}/${attempts})` : ''}`)
+    up = await wait(config.dshPort, { timeoutMs: config.startTimeoutMs })
+    if (up) {
+      log(`port ${config.dshPort} is up`)
+      break
+    }
+    log(`WARN port ${config.dshPort} did not come up in time (attempt ${attempt}/${attempts})`)
+    if (attempt === attempts) break
+    // Retry only once the failed child is really gone: a live one may still bind the port a
+    // moment later, and starting a competitor at that point is how you end up with two DSH
+    // instances racing for the same port.
+    if (isAlive(pid)) {
+      log(`previous pid ${pid} is still alive; not starting a second instance`)
+      break
+    }
+    await sleep(retryDelayMs)
+  }
+
+  if (up) {
+    await hook(config, log, deps)
+    return { started: true, pid, up: true }
+  }
+  // DSH is down and nothing is holding the port. No UI can report this — the card lives
+  // inside the page that just went away — so leave one delayed attempt behind.
+  if (schedule && !input.secondChance) {
+    await schedule({ configPath: input.configPath, config, log, deps })
+  }
+  return { started: true, pid, up: false }
+}
+
+/**
+ * The last-resort fallback: one more start attempt, later, from a process that outlives the
+ * helper.
+ *
+ * This exists because a failed restart takes DSH down and no in-page UI can report it — the
+ * card is part of the page that just disappeared. The child is detached so it survives the
+ * helper (and DSH's job), runs `service.js start` again after a delay, and is marked
+ * `--second-chance` so it can never schedule another one: exactly one extra attempt, never a
+ * loop. It is also idempotent — runStart probes the port first — so it does nothing when
+ * DSH came back on its own, or when something else owns the port.
+ */
+export function scheduleSecondChance(input) {
+  const { configPath, log } = input
+  const deps = input.deps ?? {}
+  const spawnImpl = deps.spawn ?? spawn
+  const delayMs = deps.secondChanceDelayMs ?? DEFAULT_SECOND_CHANCE_DELAY_MS
+  try {
+    const child = spawnImpl(
+      process.execPath,
+      [SERVICE_JS, 'start', '--config', configPath, '--second-chance', '--delay', String(delayMs)],
+      { detached: true, windowsHide: true, stdio: 'ignore' },
+    )
+    child.unref()
+    log(`scheduled one more start attempt in ${delayMs}ms (pid=${child.pid})`)
+    return child.pid
+  } catch (error) {
+    log(`could not schedule the fallback start attempt: ${error instanceof Error ? error.message : String(error)}`)
+    return null
+  }
 }
 
 /**
@@ -210,7 +340,14 @@ export async function runRestart(input) {
     return { restarted: false }
   }
   log(`old process ${oldPid} exited; starting a new instance`)
-  const started = await runStart({ config, log, deps })
+  const started = await runStart({
+    config,
+    log,
+    deps,
+    configPath: input.configPath,
+    secondChance: input.secondChance,
+    afterRestart: true,
+  })
   return { restarted: true, ...started }
 }
 
@@ -243,6 +380,16 @@ export async function main(argv, deps = {}) {
     return 2
   }
   const configPath = deps.configPath ?? named ?? configFilePath(resolveDshHome())
+  // `--second-chance` marks the single fallback attempt scheduleSecondChance creates. It is
+  // forbidden from creating another, so a permanent failure cannot become a retry loop.
+  const secondChance = argv.includes('--second-chance')
+  // `--delay <ms>` lets that fallback wait before it runs, without a second script.
+  const delayFlag = argv.indexOf('--delay')
+  const delayRaw = delayFlag === -1 ? null : argv[delayFlag + 1]
+  const delayMs = delayRaw === null ? 0 : Number(delayRaw)
+  if (delayRaw !== null && (!Number.isInteger(delayMs) || delayMs < 0 || delayMs > MAX_DELAY_MS)) {
+    return 2
+  }
   let config
   try {
     config = readConfig(configPath)
@@ -270,8 +417,13 @@ export async function main(argv, deps = {}) {
   // unguarded throw would become an unhandled rejection in a hidden login
   // process, which is invisible to the user.
   try {
+    if (delayMs > 0) {
+      const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+      log(`waiting ${delayMs}ms before the fallback attempt`)
+      await sleep(delayMs)
+    }
     if (mode === 'start') {
-      await runStart({ config, log, deps })
+      await runStart({ config, log, deps, configPath, secondChance })
       return 0
     }
     if (mode === 'restart') {
@@ -281,7 +433,7 @@ export async function main(argv, deps = {}) {
         log('restart requires --pid <number>')
         return 2
       }
-      await runRestart({ config, oldPid, log, deps })
+      await runRestart({ config, oldPid, log, deps, configPath, secondChance })
       return 0
     }
     return 2
