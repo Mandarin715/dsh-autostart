@@ -589,7 +589,11 @@ test('runSupervise retries a start that never came up, until the attempt limit',
     })
     assert.equal(spawns, 3, 'every attempt must be tried')
     assert.equal(result.supervised, false)
-    assert.match(lines.join('\n'), /giving up|exit/i)
+    // Pins the fourth exit path of the give-up counter: a loop that runs to exhaustion must
+    // report the same number of attempts it made. This is NOT a pin for the original defect —
+    // the old `${attempts}` code also printed 3 on this path — it is a guard so that a future
+    // edit to the new `spawned` arithmetic, or a reintroduction of the cap, breaks loudly.
+    assert.match(lines.join('\n'), /giving up: DSH did not come up after 3 attempt\(s\)/)
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
 
