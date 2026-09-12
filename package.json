@@ -1,7 +1,7 @@
 {
   "name": "dsh-autostart",
-  "version": "0.1.0",
-  "description": "Windows-only DSH plugin: boot autostart and one-click restart for the DSH service.",
+  "version": "0.2.0",
+  "description": "Windows-only DSH plugin: one-click boot autostart and a restart that cannot leave DSH down. No console window ever.",
   "type": "module",
   "main": "index.js",
   "exports": {
