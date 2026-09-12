@@ -360,13 +360,26 @@ export async function runSupervise(input) {
   log(`supervisor pid=${process.pid} watching ${config.dshPort}`)
 
   if (input.takeoverPid) {
-    log(`takeover: waiting for pid ${input.takeoverPid} to exit`)
+    // Stated as the precondition, not as an action, because service.log is the only diagnostic
+    // the user gets and the two shapes differ: a real `--takeover` genuinely waits here, while
+    // the re-entrant restart path short-circuits this wait (its child's 'exit' event already
+    // proved that pid is gone). "waiting for pid N to exit" would be false on that path.
+    log(`takeover: pid ${input.takeoverPid} must be gone before we start`)
     const waitExit = deps.waitForProcessExit ?? waitForProcessExit
-    const gone = await waitExit(input.takeoverPid, { timeoutMs: deps.takeoverExitTimeoutMs ?? DEFAULT_TAKEOVER_EXIT_MS })
-    if (!gone) {
-      log(`takeover: pid ${input.takeoverPid} is still alive; standing down without starting`)
+    try {
+      const gone = await waitExit(input.takeoverPid, { timeoutMs: deps.takeoverExitTimeoutMs ?? DEFAULT_TAKEOVER_EXIT_MS })
+      if (!gone) {
+        log(`takeover: pid ${input.takeoverPid} is still alive; standing down without starting`)
+        ;(deps.clearFile ?? clearFile)(pidFile)
+        return { supervised: false, reason: 'takeover-timeout' }
+      }
+    } catch (error) {
+      // Catch, never `finally`: this process wrote pidFile before entering the wait, so a wait
+      // that throws must not leave it pointing at a supervisor that is exiting. A `finally`
+      // would also clear it on the success path below, where this process has just become the
+      // owner and the single-instance guard depends on it. The timeout path clears explicitly.
       ;(deps.clearFile ?? clearFile)(pidFile)
-      return { supervised: false, reason: 'takeover-timeout' }
+      throw error
     }
   } else if (!(await waitForFreePort(probe, config.dshPort, log, deps))) {
     // A bare single probe cannot tell a live foreign service from a socket the kernel has not

@@ -935,7 +935,7 @@ test('runSupervise exits when a stop marker names this supervisor', async () => 
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
 
-test('runSupervise learns of the exit from the child handle, not by polling the pid', async () => {
+test('runSupervise learns of the exit from the child handle, not by polling the pid', { timeout: 1000 }, async () => {
   // The spec says it four times (design.md:46,:51,:80,:106) and the plan's architecture
   // paragraph agrees (plan.md:7): liveness is judged by `child.on('exit')`, 不轮询. The pid
   // alone cannot carry that, which is why spawnDsh returns the handle.
@@ -1049,5 +1049,109 @@ test('runSupervise watches the replacement handle when it restarts, by event', {
     assert.equal(result.supervised, true)
     assert.equal(result.pid, 222)
     assert.equal(result.child, second, 'the loop must end watching the replacement, not a stale handle')
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+// ---------------------------------------------------------------- takeover (shape B)
+
+test('runSupervise stands down without spawning when the takeover target never exits', async () => {
+  // Shape B: `supervise --takeover <pid>` names a DSH that is about to exit. If it never does,
+  // there is nobody to take over from, so this process must leave the port alone AND give back
+  // the pid file it wrote on the way in: a supervisor that stood down while holding pidFile
+  // would block every later supervisor through the single-instance guard.
+  //
+  // Regression pin, not a RED: the explicit clear on the timeout path predates this task (the
+  // brief's Step 2 predicted this test would fail because "the pid file was written early" —
+  // it does not; see task-6-report.md). It is here so a future edit to that clear line breaks
+  // something.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-supto1-'))
+  try {
+    const lines = []
+    const result = await runSupervise({
+      config: baseConfig(),
+      configPath: path.join(dir, 'config.json'),
+      takeoverPid: 4242,
+      log: (line) => lines.push(line),
+      deps: {
+        isPortListening: async () => true,
+        waitForProcessExit: async () => false,
+        spawnDsh: () => { throw new Error('must not spawn while the target is alive') },
+        sleep: async () => {},
+      },
+    })
+    assert.deepEqual(result, { supervised: false, reason: 'takeover-timeout' })
+    assert.match(lines.join('\n'), /still alive/)
+    assert.equal(fs.existsSync(path.join(dir, 'supervise.pid')), false, 'it must not claim the pid file')
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise takes over once the target exits', async () => {
+  // Regression pin, not a RED: the takeover success path already worked, and the brief's version
+  // of this test could not run at all after R18 (spawnDsh returns the handle, not a pid). The
+  // handle is faked here and asserted by identity, which pins the contract at least as strictly
+  // as the old deepEqual did.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-supto2-'))
+  try {
+    let probes = 0
+    let pidFileAtHook = null
+    const pidFile = path.join(dir, 'supervise.pid')
+    const child = fakeChild(9001)
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 10 }),
+      configPath: path.join(dir, 'config.json'),
+      takeoverPid: 4242,
+      log: () => {},
+      deps: {
+        // Busy on the first probe, free afterwards: exactly the takeover shape.
+        isPortListening: async () => { probes += 1; return probes === 1 },
+        waitForProcessExit: async () => true,
+        waitForPort: async () => true,
+        spawnDsh: () => child,
+        // Sampled while the takeover's own cleanups have all had their chance and the loop has
+        // not yet ended: this process became the pid file's owner the moment the wait said the
+        // target was gone, and a `finally` (instead of `catch`) around that wait would have
+        // cleared it here, gutting the single-instance guard for the whole supervision.
+        runHook: async () => { pidFileAtHook = fs.existsSync(pidFile); return { ran: false } },
+        isProcessAlive: () => false,
+        waitForChildExit: async (pid) => pid,
+        sleep: async () => {},
+      },
+    })
+    assert.equal(result.supervised, true)
+    assert.equal(result.pid, 9001)
+    assert.equal(result.child, child, 'the handle must travel with the pid')
+    assert.equal(result.child.pid, 9001)
+    assert.equal(pidFileAtHook, true, 'the takeover wait must not clear a pid file this process now owns')
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise does not leave its pid file behind when the takeover wait throws', async () => {
+  // The only genuine RED this task has. supervise.pid is written before the takeover wait is
+  // entered, so a wait that throws (an unreadable pid, a probe that rejects) used to escape
+  // runSupervise with the file still on disk — blocking the single-instance guard forever.
+  //
+  // The cleanup in service.js is deliberately `catch`, never `finally`: on the success path this
+  // process has just become the owner of pidFile and every later supervisor depends on it, while
+  // the timeout path already clears it explicitly.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-supto3-'))
+  const pidFile = path.join(dir, 'supervise.pid')
+  try {
+    await assert.rejects(
+      () => runSupervise({
+        config: baseConfig(),
+        configPath: path.join(dir, 'config.json'),
+        takeoverPid: 4242,
+        log: () => {},
+        deps: {
+          isPortListening: async () => true,
+          waitForProcessExit: async () => { throw new Error('probe blew up') },
+          spawnDsh: () => { throw new Error('must not spawn after a failed takeover wait') },
+          sleep: async () => {},
+        },
+      }),
+      /probe blew up/,
+      'the failure must not be swallowed into a "started" result',
+    )
+    assert.equal(fs.existsSync(pidFile), false, 'a throwing takeover wait must not leave a stale pid file')
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
