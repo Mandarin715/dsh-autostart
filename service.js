@@ -20,6 +20,8 @@ import {
   readPid,
   writePid,
   clearFile,
+  consumeRestartRequest,
+  isStopRequested,
 } from './lib/supervise-state.js'
 
 const SERVICE_JS = fileURLToPath(import.meta.url)
@@ -389,10 +391,7 @@ export async function runSupervise(input) {
     if (up) {
       log(`port ${config.dshPort} is up`)
       await hook(config, log, deps)
-      // Task 5 continues here: it takes `pid` plus the `requestFile` / `stopFile` paths derived
-      // above, waits for that child to exit, honours a restart request naming it, and restarts.
-      // They are derived here on purpose — Task 5's superviseChild consumes exactly these two.
-      return { supervised: true, pid }
+      return await superviseChild({ config, configPath, log, deps, pid, requestFile, stopFile, pidFile })
     }
     log(`WARN port ${config.dshPort} did not come up in time (attempt ${attempt}/${attempts})`)
     if (isAlive(pid)) {
@@ -408,6 +407,60 @@ export async function runSupervise(input) {
   log(`giving up: DSH did not come up after ${spawned} attempt(s); supervisor exiting`)
   ;(deps.clearFile ?? clearFile)(pidFile)
   return { supervised: false, reason: 'start-failed' }
+}
+
+/**
+ * Supervise one running DSH and, when it exits, decide what happens next.
+ *
+ * The decision is deliberately narrow: only an exit that was *asked for* — a
+ * `restart.request` naming this child — gets a replacement. A user closing DSH, or a crash,
+ * ends the story; resurrecting those would be a watchdog, and a process the user cannot
+ * stop is worse than a service that occasionally does not come back.
+ */
+async function superviseChild(input) {
+  const { config, configPath, log, pid, requestFile, stopFile, pidFile } = input
+  const deps = input.deps ?? {}
+  const waitExit = deps.waitForChildExit ?? ((childPid) => new Promise((resolve) => {
+    const tick = () => {
+      if (!defaultIsAlive(childPid)) resolve(childPid)
+      else setTimeout(tick, 500)
+    }
+    tick()
+  }))
+  const consumed = deps.consumeRestartRequest ?? consumeRestartRequest
+  const stopped = deps.isStopRequested ?? isStopRequested
+  const clear = deps.clearFile ?? clearFile
+
+  let current = pid
+  for (;;) {
+    await waitExit(current)
+    if (stopped(stopFile, process.pid)) {
+      log('stop requested; supervisor exiting')
+      clear(pidFile)
+      return { supervised: false, reason: 'stopped' }
+    }
+    if (!consumed(requestFile, current)) {
+      log(`dsh pid=${current} exited without a restart request; nothing to do`)
+      clear(pidFile)
+      return { supervised: true, pid: current }
+    }
+    log(`restart requested for pid=${current}; starting a replacement`)
+    // Re-run the start phase for one attempt; runSupervise's own guard is skipped because
+    // we already own the pid file.
+    const next = await runSupervise({
+      config,
+      configPath,
+      log,
+      deps: { ...deps, anotherSupervisorAlive: () => false },
+      takeoverPid: current,
+    })
+    if (!next.supervised || !next.pid) {
+      log('replacement did not come up; supervisor exiting')
+      clear(pidFile)
+      return { supervised: false, reason: 'restart-failed' }
+    }
+    current = next.pid
+  }
 }
 
 /**

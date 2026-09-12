@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { runStart, runSupervise, runHook, spawnDsh, scheduleSecondChance, main } from '../service.js'
-import { readPid, writePid } from '../lib/supervise-state.js'
+import { readPid, writePid, writeRestartRequest } from '../lib/supervise-state.js'
 
 function baseConfig(overrides = {}) {
   return {
@@ -782,5 +782,92 @@ test('runSupervise refuses to spawn a retry while the port still answers', async
     const text = lines.join('\n')
     assert.match(text, /still answers after waiting for it to drain/)
     assert.match(text, /giving up: DSH did not come up after 1 attempt\(s\)/)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+// ------------------------------------------------------- supervision loop
+
+test('runSupervise restarts DSH only when the exit was requested', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup4-'))
+  try {
+    const lines = []
+    let spawns = 0
+    // First child (pid 111) exits with a matching restart request; second (222) exits with
+    // none, which must end the loop without another spawn.
+    writeRestartRequest(path.join(dir, 'restart.request'), 111)
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 10 }),
+      configPath: path.join(dir, 'config.json'),
+      log: (line) => lines.push(line),
+      deps: {
+        isPortListening: async () => false,
+        waitForPort: async () => true,
+        spawnDsh: () => { spawns += 1; return spawns === 1 ? 111 : 222 },
+        runHook: async () => ({ ran: false }),
+        isProcessAlive: () => false,
+        // The replacement start goes through runSupervise's takeover wait, which uses a
+        // different seam from waitForChildExit. Left to the real one it would poll a real
+        // pid and could sit out DEFAULT_TAKEOVER_EXIT_MS on a machine where 111 exists.
+        waitForProcessExit: async () => true,
+        waitForChildExit: async (pid) => { return pid },
+        sleep: async () => {},
+      },
+    })
+    assert.equal(spawns, 2, 'the requested restart must respawn exactly once')
+    assert.deepEqual(result, { supervised: true, pid: 222 })
+    assert.match(lines.join('\n'), /restart requested/)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise does not resurrect DSH when the exit was not requested', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup5-'))
+  try {
+    const lines = []
+    let spawns = 0
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 10 }),
+      configPath: path.join(dir, 'config.json'),
+      log: (line) => lines.push(line),
+      deps: {
+        isPortListening: async () => false,
+        waitForPort: async () => true,
+        spawnDsh: () => { spawns += 1; return 777 },
+        runHook: async () => ({ ran: false }),
+        isProcessAlive: () => false,
+        waitForChildExit: async (pid) => pid,
+        sleep: async () => {},
+      },
+    })
+    assert.equal(spawns, 1, 'a plain exit is not a reason to start another instance')
+    assert.deepEqual(result, { supervised: true, pid: 777 })
+    assert.match(lines.join('\n'), /exited without a restart request/)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise exits when a stop marker names this supervisor', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup6-'))
+  try {
+    const lines = []
+    let spawns = 0
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 10 }),
+      configPath: path.join(dir, 'config.json'),
+      log: (line) => lines.push(line),
+      deps: {
+        isPortListening: async () => false,
+        waitForPort: async () => true,
+        spawnDsh: () => { spawns += 1; return 555 },
+        runHook: async () => ({ ran: false }),
+        isProcessAlive: () => false,
+        waitForChildExit: async (pid) => {
+          writePid(path.join(dir, 'supervise.stop'), process.pid)
+          return pid
+        },
+        sleep: async () => {},
+      },
+    })
+    assert.equal(spawns, 1, 'a stop must not spawn a replacement')
+    assert.equal(result.supervised, false)
+    assert.match(lines.join('\n'), /stop requested/)
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
