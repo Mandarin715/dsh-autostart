@@ -272,6 +272,13 @@ dsh-autostart/
 
 ### 5.2 流 ②:一键重启
 
+> ⚠️ **本节已由 `2026-09-12-resident-supervisor-design.md` 取代。** 重启不再经 WMI 助手。
+> 下面这段流程(第 4 步的 `service.js restart --pid`、第 6 步的 `exitDelayMs` 后退出、以及
+> `service.js restart` 那半边的"等旧 pid 消失 → 拉新实例")记的是**旧实现**;现行实现是
+> **常驻看护进程**接管:路由先确保看护进程活着,再写 `restart.request` 并退出本进程,
+> 由看护进程按 `child.on('exit')` 拉起替代实例(spec §5/§6)。
+> `waitForExitMs` 这个旋钮也因此失去了读者(见 `lib/config.js` 的注释)。
+
 ```
 用户在设置页点「重启」→ 二次确认
   → client: POST /dsh-autostart/restart

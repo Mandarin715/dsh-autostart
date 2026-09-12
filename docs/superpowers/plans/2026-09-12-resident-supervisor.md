@@ -727,7 +727,8 @@ test('runSupervise restarts DSH only when the exit was requested', async () => {
     const exits = [111, 222]
     let spawns = 0
     // First child (pid 111) exits with a matching restart request; second (222) exits with
-    // none, which must end the loop without another spawn.
+    // none, which must end the loop without another spawn. The stub is a stub: `pid` is a fake,
+    // and the default's second argument (the child handle) is simply ignored here.
     writeRestartRequest(path.join(dir, 'restart.request'), 111)
     const result = await runSupervise({
       config: baseConfig({ startTimeoutMs: 10 }),
@@ -822,22 +823,28 @@ Expected: FAIL —— 三条新测试都红(占位实现不消费标记)
  * stop is worse than a service that occasionally does not come back.
  */
 async function superviseChild(input) {
-  const { config, configPath, log, pid, requestFile, stopFile, pidFile } = input
+  const { config, configPath, log, pid, child, requestFile, stopFile, pidFile } = input
   const deps = input.deps ?? {}
-  const waitExit = deps.waitForChildExit ?? ((childPid) => new Promise((resolve) => {
-    const tick = () => {
-      if (!defaultIsAlive(childPid)) resolve(childPid)
-      else setTimeout(tick, 500)
+  const waitExit = deps.waitForChildExit ?? ((childPid, childHandle) => new Promise((resolve) => {
+    // The handle, not the pid: an exit event cannot be confused by a recycled pid.
+    // The exitCode/signalCode guard is load-bearing. This listener is attached only after
+    // runSupervise finished its port wait and the hook, so a child that died in that window
+    // has already emitted 'exit'; Node does not replay events, so a listener attached
+    // afterwards would never fire and the supervisor would wait forever on a dead child.
+    if (childHandle.exitCode !== null || childHandle.signalCode !== null) {
+      resolve(childPid)
+      return
     }
-    tick()
+    childHandle.once('exit', () => resolve(childPid))
   }))
   const consumed = deps.consumeRestartRequest ?? consumeRestartRequest
   const stopped = deps.isStopRequested ?? isStopRequested
   const clear = deps.clearFile ?? clearFile
 
   let current = pid
+  let currentChild = child
   for (;;) {
-    await waitExit(current)
+    await waitExit(current, currentChild)
     if (stopped(stopFile, process.pid)) {
       log('stop requested; supervisor exiting')
       clear(pidFile)
@@ -846,16 +853,24 @@ async function superviseChild(input) {
     if (!consumed(requestFile, current)) {
       log(`dsh pid=${current} exited without a restart request; nothing to do`)
       clear(pidFile)
-      return { supervised: true, pid: current }
+      return { supervised: true, pid: current, child: currentChild }
     }
     log(`restart requested for pid=${current}; starting a replacement`)
     // Re-run the start phase for one attempt; runSupervise's own guard is skipped because
     // we already own the pid file.
+    //
+    // The takeover wait is short-circuited because we are here only after this very child's
+    // 'exit' event fired, while still holding its handle — proof it is gone. Leaving it to
+    // waitForProcessExit would poll the pid instead: if the pid still reports alive (reuse, or
+    // EPERM, which defaultIsAlive counts as alive) the replacement stalls for the whole 30s
+    // takeover timeout, then reports restart-failed — after the restart request was already
+    // consumed and deleted. That would abandon a user-requested restart silently, with DSH
+    // down. R18's rule applies to this wait exactly as it does to the loop's own.
     const next = await runSupervise({
       config,
       configPath,
       log,
-      deps: { ...deps, anotherSupervisorAlive: () => false },
+      deps: { ...deps, anotherSupervisorAlive: () => false, waitForProcessExit: async () => true },
       takeoverPid: current,
     })
     if (!next.supervised || !next.pid) {
@@ -864,9 +879,20 @@ async function superviseChild(input) {
       return { supervised: false, reason: 'restart-failed' }
     }
     current = next.pid
+    currentChild = next.child
   }
 }
 ```
+
+> **落地时的两处偏差(以本节代码为准,不是上面 Step 1 的测试草稿)**
+> 1. 等宿主退出**不轮询**:默认实现持有子进程句柄,等 `handle.once('exit')`,并先用
+>    `exitCode`/`signalCode` 判一次"是不是在挂上监听之前就已经退出"(Node 不重放事件)。spec §4 四处
+>    写明「不轮询」。因此默认实现需要**两个参数** `(childPid, childHandle)`;Step 1 里
+>    `waitForChildExit: async (pid) => pid` 那种单参数桩仍然可用(多余实参被忽略),但默认分支只有
+>    `test/service-start.test.js` 那两条**故意不注入** `waitForChildExit` 的测试覆盖到。
+> 2. 重启时把 `waitForProcessExit` 一并短路为 `async () => true`:能走到这里,已经证明那个子进程退出
+>    (句柄的 `exit` 事件),再按 pid 轮询反而可能因为 pid 复用/EPERM 卡满 30 秒接管窗口,把一个用户
+>    请求的重启静默丢掉。
 
 - [ ] **Step 4: 运行,确认通过**
 
@@ -1035,8 +1061,20 @@ Expected: FAIL(`start` 目前走 `runStart`,`restart` 仍被接受)
       const takeoverRaw = takeoverFlag === -1 ? null : argv[takeoverFlag + 1]
       const takeoverPid = takeoverRaw === null ? null : Number(takeoverRaw)
       if (takeoverRaw !== null && (!Number.isInteger(takeoverPid) || takeoverPid <= 0)) return 2
-      await runSuperviseImpl({ config, log, deps, configPath, takeoverPid })
+      // `deps` here is main's own parameter, not the seam bag the mode implementation wants —
+      // this function's argument IS the options object, so the bag has to be handed over under
+      // its own key explicitly. A `{ …, deps }` shorthand would bind to the parameter and the
+      // supervisor would silently lose every injected seam.
+      const modeDeps = deps.deps ?? {}
+      await runSuperviseImpl({ config, log, deps: modeDeps, configPath, takeoverPid })
       return 0
+    }
+    if (mode === 'restart') {
+      // The mode is gone: DSH now hands the supervisor out of its job and writes a
+      // restart request instead. Refuse loudly — a silent 0 here would tell the caller
+      // DSH is coming back when nothing is going to start it.
+      log('restart is no longer a mode; use supervise --takeover <pid>')
+      return 2
     }
     return 2
   } catch (error) {
@@ -1194,19 +1232,26 @@ git commit -F /tmp/msg.txt   # "feat: the restart route hands over to the superv
 
 - [ ] **Step 1: 改写 README 的恢复章节**
 
-两份都做:把"0) 先等 1~2 分钟"改成常驻进程的语义 ——
+两份都做:把"0) 先等 1~2 分钟"改成常驻进程的语义(等待时长不要写死"1~2 分钟":重试预算上限 5 分钟,
+措辞用"先等几分钟")——
 
 ```markdown
-### 0) 先等 1~2 分钟 —— 看护进程会自己重试
+### 0) 先等几分钟 —— 看护进程会原地重试
 
-DSH 由常驻的看护进程启动(开机自启入口就是它)。新实例没起来时它会**原地重试**,
-间隔递增、总时长有界(默认 5 分钟)。日志里能看到:
+DSH 由常驻看护进程启动(开机自启入口就是它)。新实例没起来时它会**原地重试**,
+间隔递增(1s → 1.5s → 2.25s → …)、最多 5 次、总时长有界(默认 5 分钟)。日志里能看到:
 
     spawned dsh pid=… (attempt 2/5)
     giving up: DSH did not come up after 5 attempt(s); supervisor exiting
 
-只有这些都失败,才按下面手动补救。
+`giving up` 那行报的是**实际尝试次数**,不一定是配置上限。只有这些都失败,才按下面手动补救。
 ```
+
+> 数字与日志行必须对着代码抄(`service.js`):`DEFAULT_SUPERVISE_ATTEMPTS = 5`、
+> `DEFAULT_SUPERVISE_BACKOFF_MS = 1000`、`DEFAULT_SUPERVISE_BACKOFF_FACTOR = 1.5`、
+> `DEFAULT_SUPERVISE_TOTAL_MS = 5 * 60 * 1000`,以及上面那两条**真能打印**的字符串。
+> 旧 README 里 "重试 3 次 / 间隔 3 秒" 与 `scheduled one more start attempt in 60000ms`、
+> `waiting 60000ms before the fallback attempt` 都已随 second-chance 路径删除,不能再引用。
 
 并新增一节,说明两件用户会困惑的事:
 
@@ -1215,12 +1260,23 @@ DSH 由常驻的看护进程启动(开机自启入口就是它)。新实例没�
 
 1. **它和 DSH 同生共死**:DSH 附着在它的隐藏控制台上,所以它退出时 DSH 会一起结束。
 2. **停用自启不会立刻停掉它**:停用只是取消开机自启,当前这次开机里它和 DSH 继续跑,
-   下次重启后不再出现。想立刻收工:跑 `service.js` 的 `stop` 路径(卸载会自动做)。
+   下次登录后不再出现。
+
+   卸载会**另外**写一个停止标记,所以活着的看护进程不会在 DSH 下次消失之后继续留守。
+   **要立刻结束两者,直接关闭 DSH** —— 子进程正常退出后看护进程有意不留守(它不是看门狗)。
+   注意:CLI 里**没有** `stop` 模式(只有 `supervise` 和别名 `start`),而且写停止标记也
+   **不会立刻**停掉看护进程 —— 它只在子进程(DSH)退出之后才读那个标记。
 ```
+
+> ⚠️ **本条与派发 brief 的原文不同,以本计划为准。** brief 曾写"想立刻收工:跑 `service.js` 的 `stop`
+> 路径",但 CLI 只接受 `supervise` / `start`,别的模式返回 2(`restart` 还会打印
+> "restart is no longer a mode…");`supervise.stop` 标记也只由 `index.js` 的 `disable`/`cleanupAutostart`
+> 写入,由看护进程在**子进程退出之后**读取(`lib/supervise-launch.js` 的 `writeSuperviseStop` 有说明)。
+> 照 brief 写就会教用户执行一条不存在的命令。
 
 - [ ] **Step 2: 标注 ACCEPTANCE**
 
-在 F5/F8/F9 三段各加一行:`> **由 `docs/superpowers/specs/2026-09-12-resident-supervisor-design.md` 根治。**`(F5 另加一句:兜底的语义是"再拉一次",不是回滚。)
+在 F5/F8/F9 三段各加一行:`> **由 `docs/superpowers/specs/2026-09-12-resident-supervisor-design.md` 根治。**`(F5 另加一句:兜底的语义是"再拉一次",不是回滚。)同时把 F5 里已删的"延时兜底(`--second-chance`)"那行换掉,并让 F8/F9 的缓解指向**真正实现它的代码**(F8 → `service.js` 的 `waitForFreePort` + `runSupervise` 的原地重试;F9 → attached spawn + 看护进程的隐藏控制台),不要指向已删除的一次性路径。
 
 - [ ] **Step 3: 给旧 spec 加指针**
 
@@ -1236,6 +1292,24 @@ DSH 由常驻的看护进程启动(开机自启入口就是它)。新实例没�
 git add README.md README.zh.md docs/
 git commit -F /tmp/msg.txt   # "docs: describe the supervisor, its lifetime and the recovery path"
 ```
+
+**落地时并入的其它文档准确性修正**(都在本任务内完成):
+
+- 两份 README 的配置示例:`exitDelayMs` 写明**有效上限 5000ms**(`index.js` 的 `MAX_EXIT_DELAY_MS`,
+  超过接管窗口会把重启变成关机);`waitForExitMs` 标注为**已无读者**(`lib/config.js:14-15` 的注释)。
+- 两份 README 的手动补救:说明 `service.js start` 会把 DSH 的命绑在运行它的那个控制台上(DSH 是
+  **attached** 启动的,关掉控制台 DSH 就死),优先指 `bootstrap.vbs`;并纠正"bootstrap 把 DSH 隐藏拉起"
+  这类说法 —— 它启动的是**看护进程**,DSH 附着在它上面。
+- 三处代码注释:`service.js` 头部不再自称 "detached helper" 且模式列表改为 `supervise`/`start`;
+  `spawnDsh` 的 JSDoc 把 "~10s" 改为实测 **1.37s**、并把 `detached`(决定子进程生死)与
+  `windowsHide`(决定窗口可见性)的后果分开写(A/B 只变过 `detached`);把"一个 dshHome 一台 DSH、
+  且活看护进程看的是**这个**子进程,指向外来 pid 的请求永不被消费、会滞留"记进 `index.js` 重启路由处。
+
+**Step 5: 把关系变成断言(本任务唯一授权的代码改动)**
+
+`MAX_EXIT_DELAY_MS < DEFAULT_TAKEOVER_EXIT_MS` 此前只活在注释与一个测试字面量里 ⇒ 给 `service.js` 的
+`DEFAULT_TAKEOVER_EXIT_MS` 加 `export`,并在 `test/host-routes.test.js` 现成的 clamp 测试里用导入的
+常量替换字面量 `30000`(该测试原有断言保持不变)。
 
 ---
 

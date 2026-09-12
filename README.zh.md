@@ -20,22 +20,28 @@ Windows 专用的 DeepSeek Harness 插件:在设置页一键启用「开机自�
 
 ## 要求
 
-- Windows 10 / 11(需要能通过 PowerShell 调用 `Win32_Process.Create` —— 重启助手**刻意**交由 WMI 服务创建,以免和宿主一起被杀)
+- Windows 10 / 11(需要能通过 PowerShell 调用 `Win32_Process.Create` —— 点重启而当时**还没有看护进程**在跑时,会**刻意**交由 WMI 服务创建一个,以免和宿主一起被杀)
 - Node.js ≥ 20(随 DSH 提供)
 - DeepSeek Harness ≥ `0.1.0-rc.6`(实测于 `0.1.2-rc.1`;重启所依赖的 Job Object 行为实测于 `0.1.5-rc.1`)
 - `HKCU\...\Run` 可写(开机自启用);安全软件拦截注册表会导致「启用」失败
 
 ### 环境与重启
 
-重启助手是由 **WMI 服务**创建的,不是 DSH 直接创建的。DSH 把自己的子进程放在一个
-kill-on-close 的 Windows Job Object 里,所以仅仅 `detached` 的助手会在 DSH 退出的瞬间被
-一起杀掉 —— 结果是 DSH 停摆、再也起不来。交给 WMI 创建,它才能活得比宿主久。
+DSH 由一个**常驻看护进程**启动 —— 开机时由 `bootstrap.vbs` 跑
+`node service.js supervise --config <config.json>`。活得比 DSH 久的是这个看护进程:它从子进程句柄上
+得知 DSH 退出,并且只在「这次退出是你从设置页要的重启」时才拉起新实例。
+
+只有当你点重启、而**当时还没有看护进程**在跑(例如 DSH 是你手动起来的)时,才需要从 DSH 内部先创建一个
+看护进程。这是 **WMI 服务**唯一出场的地方:DSH 把自己的子进程放在一个 kill-on-close 的 Windows Job
+Object 里,所以仅仅 `detached` 的进程会在 DSH 退出的瞬间被一起杀掉 —— 结果是 DSH 停摆、再也起不来。
+交给 WMI 创建,看护进程才能出得了那个 job、活得比宿主久。一旦看护进程已经存在(登录后的常态,以及第一次
+重启之后的每一次),就不再经过 WMI。
 
 代价是:这样创建出来的进程**不继承你的环境变量**。因此:
 
-- 助手的 config.json 路径由宿主用 `--config <绝对路径>` 显式告知(而不是让助手去按
+- 看护进程的 config.json 路径由宿主用 `--config <绝对路径>` 显式告知(而不是让它去按
   `DSH_HOME` 推导 —— 那个变量在这里是缺失的);
-- 重启时用 config.json 里记录的 `dshHome` 重新断言 `DSH_HOME`。
+- 重启后的实例用 config.json 里记录的 `dshHome` 重新断言 `DSH_HOME`。
 
 其余环境变量(自定义 `PATH`、DSH 读取的其他变量)**不会**被带到重启后的实例。如果你的
 DSH 配置依赖环境变量,请留意这一点,并尽量让 `command.execPath` 是绝对路径。
@@ -55,7 +61,7 @@ dsh plugin --profile web add github:Mandarin715/dsh-autostart
 | 服务状态 | 实时探测端口,显示运行中/已停止 |
 | 开机自启开关 | 启用时会写 `~/.dsh/dsh-autostart/config.json`、生成 `bootstrap.vbs`,并写入注册表 `HKCU\...\Run` 的 `DSH autostart` 项 |
 | 当前访问地址 | 从捕获的启动输出里解析出的最新带 token 地址,可一键复制 |
-| 重启服务 | 二次确认后重启;DSH 会在数秒内恢复 |
+| 重启服务 | 二次确认后重启;DSH 会在数秒内恢复。它会先确保有看护进程在跑、由它把 DSH 拉回来;起步失败则当场拒绝这次重启 |
 | 钩子脚本 | 可选。服务起来后会执行它,用于拉起你自己的依赖进程 |
 
 > **页面完全打不开?** 这张卡片只在 DSH 运行时才存在 —— 见下面的「服务没起来时怎么救」。
@@ -70,13 +76,19 @@ dsh plugin --profile web add github:Mandarin715/dsh-autostart
   config:
     hookScript: ''                 # 可选,服务起来后执行的脚本绝对路径
     dshPort: 3080
-    exitDelayMs: 800
-    waitForExitMs: 30000
+    exitDelayMs: 800               # 重启时旧宿主退出前的延时;上限 5000(见下方说明)
+    waitForExitMs: 30000           # 自常驻看护进程取代旧重启路径后已无读者 —— 保留只是为了让
+                                   # 已存在的 config.json 仍能加载
     startTimeoutMs: 30000
     openBrowserOnBoot: false       # true = 开机时自动打开浏览器
     blockWhenAgentsRunning: false  # true = 有 Agent 在跑时拒绝重启
     allowedHosts: []               # 经反代访问时填你的域名(必须显式填写),如 ['derp.example.com']
 ```
+
+> **`exitDelayMs` 的有效上限是 5000 毫秒。** 这个延时只为让重启响应先刷出去、旧宿主再退出;而新拉起的
+> 看护进程等这个宿主退出只等 30 秒(`DEFAULT_TAKEOVER_EXIT_MS`)。延时超过那个窗口,接管就会放弃并收工,
+> 重启也就变成了关机 —— 所以超过 5000 的值在使用处被**截断到 5000**,而不是拒绝加载
+> (`index.js` 的 `MAX_EXIT_DELAY_MS`)。
 
 > **`allowedHosts` 必须由你显式填写(opt-in)。** 默认是空数组,即**不信任任何非回环的 Host**。
 > 如果你是通过反向代理访问 DSH(例如 frp + auth-proxy,它会把浏览器发来的**原始 Host** 转发过来),
@@ -90,11 +102,12 @@ dsh plugin --profile web add github:Mandarin715/dsh-autostart
 校验——填进白名单本身就是显式授权,而 Origin 与 Host 的同源校验依然必须成立。回环地址仍保持严格端口校验。
 
 > **改配置后要不要重新启用自启?——要,但原因不是 dispose。**
-> `hookScript` / `dshPort` / `waitForExitMs` / `startTimeoutMs` 这些字段是在**「启用自启」时快照进
-> `config.json`** 的,而助手读的是 `config.json`、不是插件的实时配置。所以改了它们**必须回设置页
+> `hookScript` / `dshPort` / `startTimeoutMs` 这些字段是在**「启用自启」时快照进
+> `config.json`** 的,而看护进程读的是 `config.json`、不是插件的实时配置。所以改了它们**必须回设置页
 > 重新点一次「启用自启」**才会生效(重复启用是幂等的)。真机实测过:改了 `hookScript` 却只重启服务,
 > `config.json` 里仍是旧值,钩子不会执行。
 > 而 `allowedHosts` 只影响插件的路由守卫,重载即生效,与自启无关。
+> `waitForExitMs` 同样会被快照,但已经没有任何代码读它(见上方配置示例里的说明)。
 >
 > **注册表项不会因为改配置而消失。** 插件只在自己**真的被卸载**时(判据:本插件的 `service.js`
 > 已不存在)才移除 `DSH autostart`;DSH 因重载或加载失败而拆解插件树时**保留**它。
@@ -159,39 +172,59 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "DSH Web" /f
 ```
 ~/.dsh/dsh-autostart/
 ├── config.json               # 记录真实启动命令,service.js 读取
-├── bootstrap.vbs             # 开机入口(wscript 无窗口)
+├── bootstrap.vbs             # 开机入口:拉起常驻看护进程(wscript 无窗口)
 ├── dsh-web-server.log        # DSH stdout(含访问地址)
 ├── dsh-web-server.err.log
-└── service.log               # 助手日志,排查问题先看这里
+├── service.log               # 看护进程日志,排查问题先看这里
+├── supervise.pid             # 看护进程自报的 pid(单实例守卫)
+├── restart.request           # 重启时写入,记的是看护进程看到的那个退出的 DSH
+└── supervise.stop            # 通知活着的看护进程在 DSH 消失后收工
 ```
+
+后三个是**临时状态文件**:需要时创建、用完删除(全部尽力而为),不存在是正常的。
 
 ## 服务没起来时怎么救
 
 **卡片在 DSH 的页面里 —— DSH 没起来时你打不开卡片**,所以补救必须走命令行。按下面顺序来。
 
-### 0) 先等 1~2 分钟 —— 插件会自己兜底
+### 0) 先等几分钟 —— 看护进程会原地重试
 
-新实例没起来时,助手**不会干等就放弃**:
+DSH 是由**常驻看护进程**启动的 —— 开机自启那条入口指向的**就是它**,所以在该有 DSH 的时候它总在。
+新实例没起来时,看护进程不会干等就放弃:
 
-1. 它会**把启动重试最多 3 次**(每次等 `startTimeoutMs`,默认 30 秒;两次之间隔 3 秒)。
-   *前提是上一次那个子进程确实已经退出* —— 如果它还活着,助手不会另起一个去抢同一个端口。
-2. 3 次都不行,它会**再安排一次延时尝试(默认 60 秒后)**,由一个能活过助手的独立进程执行。
-   这一次**只做一次,不会再安排下一次**,所以不会变成无限重试。
+1. 它会**原地重试**,间隔递增 1s → 1.5s → 2.25s → …,最多 **5 次**、总时长上限 **5 分钟**;每次等
+   `startTimeoutMs`(默认 30 秒)。*前提是上一次那个子进程确实已经退出* —— 如果它还活着,它不会另起一个
+   去抢同一个端口。
+2. 它**不会再安排"以后某次"**:看护进程本身就活过这次尝试,重试就发生在那个已经在看着端口的进程里。
 
-因此失败之后**先等 1~2 分钟再动手**。日志里能看到它的动作:
+因此失败之后**先等几分钟再动手** —— 整个重试预算最多 5 分钟。日志里能看到它的动作:
 
 ```
-spawned dsh pid=… (attempt 2/3)                  ← 正在重试
-scheduled one more start attempt in 60000ms (pid=…)   ← 已安排兜底
-waiting 60000ms before the fallback attempt       ← 兜底真的跑起来了
+spawned dsh pid=… (attempt 2/5)                        ← 正在重试
+giving up: DSH did not come up after 5 attempt(s); supervisor exiting
 ```
+
+那行 `giving up` 报的是**实际尝试过的次数**,不一定等于配置上限 5。
 
 只有这些都失败,才按下面手动补救。
+
+### 关于常驻进程(两条必须知道)
+
+1. **它和 DSH 同生共死。** DSH 是**附着(attached)**在它的隐藏控制台上启动的(正是这个共享让每条命令
+   不再弹窗),所以看护进程退出时 DSH 会一起结束。
+2. **停用自启并不会立刻停掉它。** 停用只是取消**开机**自启 —— 当前这次开机里看护进程和你的 DSH 继续跑,
+   下次登录后不再出现。
+   - 卸载会**另外**写一个停止标记,所以活着的看护进程不会在 DSH 下次消失之后继续留守。
+   - **要立刻结束两者,直接关闭 DSH** —— 子进程正常退出后,看护进程有意不留守。它只在**你从设置页请求的
+     重启**时才把 DSH 拉回来,它不是看门狗。
+   - CLI 里**没有** `stop` 模式(只有 `supervise` 和它的别名 `start`),而且写停止标记也**不会立刻**停掉
+     看护进程:它**只在子进程(DSH)退出之后**才读那个标记。这个顺序是有意为之 —— 停用自启不该关掉你正在
+     用的 DSH。
 
 ### 1) 先看日志找原因
 
 ```
-~/.dsh/dsh-autostart/service.log            # 助手日志:先看这个
+~/.dsh/dsh-autostart/service.log            # 看护进程日志:先看这个
 ~/.dsh/dsh-autostart/dsh-web-server.err.log # DSH 自己的报错
 ```
 
@@ -209,8 +242,18 @@ waiting 60000ms before the fallback attempt       ← 兜底真的跑起来了
 wscript.exe "$env:USERPROFILE\.dsh\dsh-autostart\bootstrap.vbs"
 ```
 
-它执行 `<node> <service.js> start --config <config.json>`,把 DSH 隐藏拉起,并把 DSH 的 stdout
-写进 `~/.dsh/dsh-autostart/dsh-web-server.log` —— 成功的话那里面就会出现新的带 token 地址。
+它执行 `<node> <service.js> start --config <config.json>`(`start` 是 `supervise` 的别名)。这条命令创建出的
+就是**常驻看护进程**,它拥有一个**隐藏**控制台 —— DSH 附着在它上面启动,所以 DSH 没有可见窗口;DSH 的
+stdout 写进 `~/.dsh/dsh-autostart/dsh-web-server.log` —— 成功的话那里面就会出现新的带 token 地址。
+
+> 看护进程**会一直活到 DSH 结束**,并始终持有 DSH。不要杀它:它是 DSH 的父进程,它退出 DSH 也会跟着结束。
+
+#### 也可以直接跑 CLI
+
+`node service.js start --config <config.json 的绝对路径>` 做的是同一件事,但它把 DSH 的命绑在**你运行它的
+那个控制台**上:DSH 是**附着**启动的,所以关掉那个窗口就会终止 DSH;而且看护进程会**占住前台**直到 DSH 退出。
+用这种形式就把窗口一直留着;否则优先用上面的 `bootstrap.vbs` —— 它给看护进程一个自己的隐藏控制台,并且
+立刻返回。
 
 ### 3) 如果连 `config.json` 都不存在
 
@@ -270,7 +313,7 @@ wscript.exe "$env:USERPROFILE\.dsh\dsh-autostart\bootstrap.vbs"
 ## 为什么这样实现(踩坑记录)
 
 - **为什么用 `wscript.exe` 而不是 `powershell -WindowStyle Hidden`**:后者对长时间运行的脚本不可靠,会留下一个无法关闭的空控制台窗口。
-- **为什么等待用条件轮询而不是固定 `Start-Sleep`**:固定等待曾让一次重启耗时 80 秒以上;条件轮询把它压到数秒。
+- **为什么等端口用条件轮询而不是固定 `Start-Sleep`**:固定等待曾让一次重启耗时 80 秒以上;条件轮询(`waitForPort`,间隔 250ms、受 `startTimeoutMs` 约束)把它压到数秒。看护进程**不轮询 DSH 进程本身** —— 它持有子进程句柄,等的是那个句柄的 `exit` 事件。
 - **为什么端口判定用 TCP 连接而不是 `netstat`/`:port` 子串**:子串匹配会命中 `TIME_WAIT` 与客户端连接,导致"其实没启动却报告已在运行"。
 - **为什么用 Node 而不是 PowerShell 实现逻辑**:PowerShell 脚本里的中文易出现编码问题,且受执行策略限制。
 - **为什么必须写 `--no-open`**:DSH `0.1.2-rc.1` 每次启动生成新的 token,访问地址会打印在 stdout;插件把它捕获到日志并在设置页展示,因此开机时无需(也不应)弹出浏览器。

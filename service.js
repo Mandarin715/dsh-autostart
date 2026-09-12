@@ -1,13 +1,23 @@
 #!/usr/bin/env node
-// dsh-autostart — detached helper.
+// dsh-autostart — the resident supervisor.
 //
 // Modes:
-//   start    used by bootstrap.vbs at login
-//   restart  used by the plugin's restart button (waits for the old pid first)
+//   supervise                    the real entry point: own DSH's lifetime
+//   supervise --takeover <pid>   take over from that DSH once it exits
+//   start                        an alias of `supervise` (bootstrap.vbs snapshots this name at
+//                                enable time, so old installs must keep working without
+//                                re-enabling autostart)
+//
+// Any other mode — `restart` included — is refused with exit code 2: DSH now hands a supervisor
+// out of its job and writes a restart request instead.
+//
+// DSH is spawned attached to this process's hidden console, so this process's life is what keeps
+// DSH alive: it may not exit before DSH does. That is why it stays resident instead of checking
+// the port and returning.
 //
 // This file intentionally imports nothing from the DSH runtime: it reads
 // config.json and drives the OS, so it can be run by hand for debugging:
-//     node service.js start
+//     node service.js supervise --config <abs path to config.json>
 import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
@@ -35,7 +45,12 @@ const DEFAULT_PORT_PROBE_INTERVAL_MS = 250
 // How long `supervise --takeover <pid>` waits for that DSH to exit before concluding it is
 // not going to. See runSupervise: without the takeover shape an on-demand supervisor would
 // see a busy port, stand down, and leave nobody to restart DSH when the old one exits.
-const DEFAULT_TAKEOVER_EXIT_MS = 30000
+//
+// Exported because index.js's MAX_EXIT_DELAY_MS must stay below it (that clamp only exists to let
+// the restart response flush, so a delay past this window would make the takeover give up and
+// stand down — i.e. a restart would become a shutdown). The clamp test imports this constant
+// instead of restating the number, so lowering it below MAX_EXIT_DELAY_MS fails a test.
+export const DEFAULT_TAKEOVER_EXIT_MS = 30000
 
 // The supervisor retries a start that never came up. Backoff grows 1s, 1.5s, 2.25s … and
 // the whole effort is bounded so a permanently broken command cannot retry forever.
@@ -68,28 +83,28 @@ export function dshEnv(config, base = process.env) {
 /**
  * Launch DSH attached to this process's console.
  *
- * Both flags are load-bearing and were measured, not guessed. `detached: true` is
- * DETACHED_PROCESS, which leaves the host with no console; `windowsHide: true` is
- * CREATE_NO_WINDOW, which does not set a console handle either. DSH's sandbox cannot give
- * its tool subprocesses their own hidden console under the restricted token
- * (dsh-sandbox-windows-acl: CREATE_NO_WINDOW children die with STATUS_DLL_INIT_FAILED), so
- * they must share the host's — and with no host console each of them created a fresh one
- * that Windows 11 handed to Windows Terminal: one visible window per command (F9).
+ * The two flags below are there for different reasons, and they were not measured the same way.
  *
- * Clearing either flag makes the child die with its parent instead (measured: an attached
- * child of a WMI-created parent is gone within ~10s of that parent exiting), so this
- * function may only be called by a process that stays alive for DSH's whole lifetime —
- * the supervisor.
+ * `windowsHide: false` is what keeps the child sharing this process's console instead of being
+ * given CREATE_NO_WINDOW: DSH's sandbox cannot give its tool subprocesses their own hidden
+ * console under the restricted token (dsh-sandbox-windows-acl: CREATE_NO_WINDOW children die
+ * with STATUS_DLL_INIT_FAILED), so they must share the host's — and a host with no console made
+ * each of them create a fresh one that Windows 11 handed to Windows Terminal: one visible window
+ * per command (F9).
+ *
+ * `detached: false` is what keeps the child attached to that console, and its consequence is
+ * about the child's LIFE, not the window. The A/B test in docs/ACCEPTANCE.md (F9) varied
+ * `detached` alone, with a WMI-created parent that exited immediately, and measured an attached
+ * child gone within ~1.4s of its parent (1.37s at 1s resolution, Task 1) versus >2.5 minutes for
+ * a detached one. So this function may only be called by a process that stays alive for DSH's
+ * whole lifetime — the supervisor. `windowsHide` was held constant in that test and has not been
+ * isolated on its own.
  *
  * Returns the ChildProcess handle, not its pid. The caller is the process that has to
  * outlive DSH, and it learns of DSH's exit from that handle's 'exit' event — the spec is
  * explicit that the host's liveness is judged by `child.on('exit')` and not by polling. A
  * pid cannot carry that: once the child is gone the pid says nothing, and a recycled one
  * would say the opposite of the truth.
- *
- * TODO(Task 7): the one-shot `start` path still calls this from a helper that exits
- * immediately, so that contract is violated by this file's own caller until the CLI is
- * moved onto the supervisor.
  */
 export function spawnDsh(config, log = () => {}, deps = {}) {
   // parseConfigFile does not validate logPaths (it cannot — it never receives

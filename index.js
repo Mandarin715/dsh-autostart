@@ -76,10 +76,10 @@ const LAUNCH_DETAIL_MAX = 200
  *
  * The delay exists only to let the 202 response flush before this process exits. It must stay
  * well inside the window a freshly started supervisor waits for this pid to exit:
- * DEFAULT_TAKEOVER_EXIT_MS = 30000 in service.js. Past that window the supervisor concludes the
- * takeover is not happening, stands down, and the restart becomes a shutdown. Clamped at the
- * use site rather than in lib/config.js, so an existing config.json with a larger value still
- * loads (and README's advertised knob still exists).
+ * DEFAULT_TAKEOVER_EXIT_MS (exported by service.js, 30000). Past that window the supervisor
+ * concludes the takeover is not happening, stands down, and the restart becomes a shutdown.
+ * Clamped at the use site rather than in lib/config.js, so an existing config.json with a larger
+ * value still loads (and README's advertised knob still exists).
  */
 const MAX_EXIT_DELAY_MS = 5000
 
@@ -502,8 +502,11 @@ export function createHandlers(deps) {
         // Assumes one DSH per dshHome and that a live supervisor is watching THIS child. A
         // supervisor watching a different child cannot be told apart from ours here: start()
         // would read that already-live pid and report success. The request below names this
-        // process, and a supervisor honours a request only for the child it saw exit, so the
-        // deeper case is a known limit of this check rather than something it can fix.
+        // process, and a supervisor honours a request only for the child it saw exit, so a
+        // request naming any other pid is never consumed by anyone — it just stays on disk as
+        // a stale `restart.request` until something overwrites it. That is a known limit of
+        // this check, not something it can fix; keep the one-DSH-per-dshHome assumption when
+        // changing anything here.
         if (!supervisor.isAlive()) {
           // Bounded inside (10s): it throws rather than waiting forever, and the launcher it
           // runs is awaited on purpose — the relay runs inside DSH's job, so it has to finish
@@ -548,8 +551,9 @@ export function createHandlers(deps) {
       // Clamped at the use site, not in lib/config.js, so an existing config.json with a larger
       // value still loads. The delay only exists to let the 202 flush before this process exits,
       // and it must stay well inside the window a freshly started supervisor waits for this pid
-      // to exit (DEFAULT_TAKEOVER_EXIT_MS = 30000 in service.js). A delay past that window makes
-      // the takeover give up and stand down, i.e. a restart would become a shutdown.
+      // to exit (DEFAULT_TAKEOVER_EXIT_MS in service.js, which exports it so the clamp test can
+      // assert the relationship). A delay past that window makes the takeover give up and stand
+      // down, i.e. a restart would become a shutdown.
       scheduleExit(() => process.exit(0), Math.min(pluginConfig.exitDelayMs, MAX_EXIT_DELAY_MS))
     },
   }

@@ -14,6 +14,7 @@ import {
 } from '../lib/config.js'
 import { readPid, writePid } from '../lib/supervise-state.js'
 import { registryCommand } from '../lib/registry.js'
+import { DEFAULT_TAKEOVER_EXIT_MS } from '../service.js'
 
 /** A dsh home that matches the `C:\\dsh` used throughout this file. */
 const HOME = 'C:\\dsh'
@@ -522,12 +523,16 @@ test('the scheduled exit delay is clamped below the supervisor takeover window',
     await handlers.restart(fakeReq(), res)
     assert.equal(res.statusCode, 202)
   }
-  // A freshly started supervisor waits only DEFAULT_TAKEOVER_EXIT_MS (service.js, 30s) for this
-  // pid to exit. A user-set delay past that window makes the takeover give up and stand down,
-  // which turns a restart into a shutdown.
+  // A freshly started supervisor waits only DEFAULT_TAKEOVER_EXIT_MS (service.js) for this pid to
+  // exit. A user-set delay past that window makes the takeover give up and stand down, which turns
+  // a restart into a shutdown. The constant is imported rather than restated so that lowering the
+  // window below the clamp cannot leave this test passing against an impossible assumption.
   await run(60000)
   assert.deepEqual(delays, [5000], 'a delay above the cap must be clamped')
-  assert.ok(delays[0] < 30000, 'the clamp must stay inside the supervisor takeover window')
+  assert.ok(
+    delays[0] < DEFAULT_TAKEOVER_EXIT_MS,
+    'the clamp must stay inside the supervisor takeover window',
+  )
   await run(200)
   assert.deepEqual(delays, [5000, 200], 'a delay below the cap is honoured as configured')
 })

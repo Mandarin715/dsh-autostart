@@ -20,23 +20,29 @@ The software is provided "as is" (MIT License, no warranty of any kind).
 
 ## Requirements
 
-- Windows 10 / 11 (`Win32_Process.Create` must work through PowerShell — the restart helper is deliberately created by the WMI service, so that it is not killed together with the host)
+- Windows 10 / 11 (`Win32_Process.Create` must work through PowerShell — when you click restart and no supervisor is
+  running yet, one is deliberately created by the WMI service, so that it is not killed together with the host)
 - Node.js ≥ 20 (shipped with DSH)
 - DeepSeek Harness ≥ `0.1.0-rc.6` (tested on `0.1.2-rc.1`; the job-object behaviour the restart depends on was measured on `0.1.5-rc.1`)
 - A writable `HKCU\...\Run` for autostart — security software that blocks registry writes makes "enable" fail
 
 ### Environment and restart
 
-The restart helper is created by the **WMI service**, not by DSH directly. DSH runs its
-subprocesses inside a Windows Job Object created kill-on-close, so a merely "detached" helper is
-killed the instant DSH exits — leaving DSH down. Having WMI create it is what lets it outlive the
-host.
+DSH is started by a **resident supervisor** — `node service.js supervise --config <config.json>`, launched by
+`bootstrap.vbs` at login. The supervisor is what outlives DSH: it learns of DSH's exit from its child handle, and
+starts the replacement when the exit was a restart you asked for.
+
+When you click restart and **no supervisor is running yet** (for example you started DSH by hand), one has to be
+created from inside DSH first. That is the only moment the **WMI service** is involved: DSH runs its
+subprocesses inside a Windows Job Object created kill-on-close, so a merely "detached" process is killed the instant
+DSH exits — leaving DSH down. Having WMI create the supervisor is what lets it out of that job and lets it outlive
+the host. Once a supervisor exists (the normal case at login, and every restart after the first), WMI is not used.
 
 One consequence: a process created that way does **not** inherit your environment. So:
 
-- the helper is told where `config.json` lives explicitly (`--config <absolute path>`), instead of
+- the supervisor is told where `config.json` lives explicitly (`--config <absolute path>`), instead of
   re-deriving the DSH home from `DSH_HOME` (which would be missing);
-- the restart re-asserts `DSH_HOME` from the `dshHome` captured in `config.json`.
+- the restarted instance re-asserts `DSH_HOME` from the `dshHome` captured in `config.json`.
 
 Other environment variables (a custom `PATH`, extra variables DSH reads) are **not** carried over
 to the restarted instance. If your DSH setup depends on environment variables, keep that in mind,
@@ -57,7 +63,7 @@ Restart DSH, then open Settings → General and scroll to the bottom to find thi
 | Service status | Probes the port live; shows running / stopped |
 | Boot autostart toggle | When enabled, writes `~/.dsh/dsh-autostart/config.json`, generates `bootstrap.vbs`, and adds the `DSH autostart` entry under `HKCU\...\Run` |
 | Current access URL | The newest token-bearing URL parsed out of the captured startup output; one-click copy |
-| Restart service | Restarts after a confirmation; DSH is back within seconds |
+| Restart service | Restarts after a confirmation; DSH is back within seconds. It first makes sure a supervisor is running to bring DSH back, and refuses the restart if none can be started |
 | Hook script | Optional. Run once the service is up, to start your own dependent processes |
 
 > **Cannot open the page at all?** This card only exists while DSH is running — see
@@ -73,13 +79,19 @@ In the profile's `cordis.patch.yml`:
   config:
     hookScript: ''                 # optional, absolute path to a script run after the service starts
     dshPort: 3080
-    exitDelayMs: 800
-    waitForExitMs: 30000
+    exitDelayMs: 800               # delay before the old host exits on restart; clamped to 5000 max (see below)
+    waitForExitMs: 30000           # UNUSED since the supervisor replaced the old restart path — kept only so an
+                                   # existing config.json that sets it still loads
     startTimeoutMs: 30000
     openBrowserOnBoot: false       # true = open the browser on boot
     blockWhenAgentsRunning: false  # true = refuse to restart while an agent is running
     allowedHosts: []               # for reverse-proxy access, add your domain (must be opted in), e.g. ['derp.example.com']
 ```
+
+> **`exitDelayMs` is clamped at 5000 ms.** The delay only exists to let the restart response flush before the old host
+> exits, and a freshly started supervisor waits only 30 s (`DEFAULT_TAKEOVER_EXIT_MS`) for that host to exit. A delay
+> past that window would make the takeover give up, turning a restart into a shutdown — so values above 5000 are
+> clamped to 5000 at the point of use, not rejected (`index.js`, `MAX_EXIT_DELAY_MS`).
 
 > **`allowedHosts` is opt-in — you must add the entry yourself.** The default is an empty array, meaning **no non-loopback Host is trusted**.
 > If you reach DSH through a reverse proxy (for example frp + auth-proxy, which forwards the browser's **original Host**),
@@ -94,11 +106,12 @@ allow-listed authorities** — the entry itself is the explicit opt-in, and the 
 Loopback keeps the strict port check.
 
 > **Do config changes require re-enabling autostart? Yes — but not because of dispose.**
-> `hookScript`, `dshPort`, `waitForExitMs` and `startTimeoutMs` are **snapshotted into `config.json` when you click
-> Enable**, and the helper reads `config.json`, not the plugin's live config. So after changing them you **must open the
+> `hookScript`, `dshPort` and `startTimeoutMs` are **snapshotted into `config.json` when you click
+> Enable**, and the supervisor reads `config.json`, not the plugin's live config. So after changing them you **must open the
 > settings card and enable autostart again** (re-enabling is idempotent). Measured on a real install: changing
 > `hookScript` and only restarting the service left the old value in `config.json`, so the hook never ran.
 > `allowedHosts` is different — it only affects the plugin's route guard and takes effect on reload.
+> `waitForExitMs` is snapshotted too, but is no longer read by anything (see the note in the config example above).
 >
 > **The registry entry does not disappear because you edited the config.** The plugin removes `DSH autostart` only when it
 > is genuinely uninstalled (evidence: its own `service.js` is gone); when DSH tears the plugin tree down for a reload or a
@@ -168,41 +181,63 @@ this plugin be your only autostart entry.
 ```
 ~/.dsh/dsh-autostart/
 ├── config.json               # the real launch command, read by service.js
-├── bootstrap.vbs             # boot entry point (wscript, no window)
+├── bootstrap.vbs             # boot entry point: launches the resident supervisor (wscript, no window)
 ├── dsh-web-server.log        # DSH stdout (contains the access URL)
 ├── dsh-web-server.err.log
-└── service.log               # helper log; look here first when debugging
+├── service.log               # supervisor log; look here first when debugging
+├── supervise.pid             # the supervisor's own pid (single-instance guard)
+├── restart.request           # written by a restart; names the DSH the supervisor saw exit
+└── supervise.stop            # tells a running supervisor to stop once DSH is gone
 ```
+
+The last three are transient state files: they are created and deleted as needed (all best-effort), and their absence
+is normal.
 
 ## If the service will not start (recovery)
 
 **The card lives inside DSH's page — so when DSH is down you cannot open the card.** Recovery therefore has to be
 command-line. Work down this list.
 
-### 0) Wait a minute or two first — the plugin retries on its own
+### 0) Wait a few minutes first — the supervisor retries in place
 
-When the replacement instance does not come up, the helper does not simply give up:
+DSH is started by the **resident supervisor** — the login autostart entry *is* the supervisor, so it is always there
+when DSH is supposed to be. When a new instance does not come up, the supervisor does not simply give up:
 
-1. It **retries the start up to 3 times** (each waits `startTimeoutMs`, 30s by default, with a 3s pause between).
-   It only retries once the failed child is **really gone** — while one is still alive it will not start a competitor
-   for the same port.
-2. If all attempts fail it **schedules one delayed attempt** (60s by default), run by a process that outlives the
-   helper. That attempt is **marked so it can never schedule another**, so this cannot become a retry loop.
+1. It **retries in place**, with the interval growing 1s → 1.5s → 2.25s → …, up to **5 attempts** and a total
+   **5-minute** budget. Each attempt waits `startTimeoutMs` (30s by default). It only retries once the failed child
+   is **really gone** — while one is still alive it will not start a competitor for the same port.
+2. Nothing is scheduled for later: **the supervisor itself outlives the attempt**, so the retry happens inside the
+   one process that is already watching the port.
 
-So after a failure, **wait 1–2 minutes before intervening by hand**. The helper says what it is doing:
+So after a failure, **wait a few minutes before intervening by hand** — the whole retry budget is 5 minutes at most.
+The supervisor says what it is doing:
 
 ```
-spawned dsh pid=… (attempt 2/3)                       # retrying
-scheduled one more start attempt in 60000ms (pid=…)   # fallback armed
-waiting 60000ms before the fallback attempt           # fallback actually ran
+spawned dsh pid=… (attempt 2/5)                        # retrying
+giving up: DSH did not come up after 5 attempt(s); supervisor exiting
 ```
+
+The `giving up` line reports the number of attempts **actually made**, which is not always the configured cap of 5.
 
 Only if all of that fails, continue below.
+
+### About the resident supervisor (two things you must know)
+
+1. **Its life and DSH's are the same.** DSH is spawned *attached* to the supervisor's hidden console (that sharing is
+   what stops each command from opening a visible window), so when the supervisor exits, DSH goes with it.
+2. **Disabling autostart does not stop it.** Disabling cancels the *login* autostart only — the supervisor and your
+   running DSH keep going for the rest of this session, and simply will not come back at the next login.
+   - Uninstalling additionally writes a stop marker, so a running supervisor will not linger once DSH next goes away.
+   - **To end both immediately, close DSH** — the supervisor deliberately does not linger when its child exits
+     normally. It restarts DSH only for a restart you asked for from the settings page; it is not a watchdog.
+   - There is no `stop` mode in the CLI, and writing the stop marker does **not** stop the supervisor on the spot:
+     the supervisor reads that marker only after its child (DSH) exits. That ordering is deliberate — disabling
+     autostart must not close the DSH you are using. The only modes are `supervise` and its alias `start`.
 
 ### 1) Read the logs first
 
 ```
-~/.dsh/dsh-autostart/service.log            # the helper's log: start here
+~/.dsh/dsh-autostart/service.log            # the supervisor's log: start here
 ~/.dsh/dsh-autostart/dsh-web-server.err.log # DSH's own errors
 ```
 
@@ -221,8 +256,20 @@ opens no window:
 wscript.exe "$env:USERPROFILE\.dsh\dsh-autostart\bootstrap.vbs"
 ```
 
-It runs `<node> <service.js> start --config <config.json>`, starts DSH hidden, and writes DSH's stdout to
-`~/.dsh/dsh-autostart/dsh-web-server.log` — on success a fresh token URL appears there.
+It runs `<node> <service.js> start --config <config.json>` (`start` is an alias of `supervise`). That becomes the
+resident supervisor, which owns a **hidden** console — DSH is spawned attached to it, so DSH has no visible window,
+and its stdout is written to `~/.dsh/dsh-autostart/dsh-web-server.log` — on success a fresh token URL appears there.
+
+> The supervisor **stays running for as long as DSH does** and keeps owning it. Do not kill it: it is DSH's parent,
+> and when it exits DSH goes with it.
+
+#### If you would rather run the CLI directly
+
+`node service.js start --config <absolute path to config.json>` does the same thing, but it ties DSH's life to the
+console you ran it from. DSH is spawned **attached**, so closing that window terminates DSH — and the supervisor stays
+in the foreground until DSH exits. If you use this form, leave the window open for as long as you want DSH up;
+otherwise prefer the `bootstrap.vbs` form above, which gives the supervisor its own hidden console and returns
+immediately.
 
 ### 3) If `config.json` does not exist at all
 
@@ -285,7 +332,7 @@ current command is captured.
 ## Why it is built this way
 
 - **Why `wscript.exe` instead of `powershell -WindowStyle Hidden`**: the latter is unreliable for long-running scripts and leaves an empty console window that cannot be closed.
-- **Why waiting uses conditional polling instead of a fixed `Start-Sleep`**: a fixed wait once made a single restart take over 80 seconds; conditional polling brought it down to a few seconds.
+- **Why waiting for the port uses conditional polling instead of a fixed `Start-Sleep`**: a fixed wait once made a single restart take over 80 seconds; conditional polling (`waitForPort`, 250ms apart, bounded by `startTimeoutMs`) brought it down to a few seconds. The supervisor does **not** poll the DSH process itself — it holds the child handle and waits for its `exit` event.
 - **Why the port check uses a TCP connection instead of a `netstat`/`:port` substring**: substring matching also hits `TIME_WAIT` and client connections, so it reported "already running" when nothing had actually started.
 - **Why the logic is Node rather than PowerShell**: Chinese text in PowerShell scripts tends to hit encoding problems, and execution policy gets in the way.
 - **Why `--no-open` is mandatory**: DSH `0.1.2-rc.1` mints a new token on every start and prints the access URL to stdout; the plugin captures it into the log and shows it in the settings page, so opening a browser at boot is neither needed nor wanted.
