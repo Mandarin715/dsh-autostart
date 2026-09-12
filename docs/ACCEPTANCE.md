@@ -138,7 +138,7 @@ $r = ([wmiclass]'Win32_Process').Create('<cmdline>', $null, $startup)
 **已验证**:用**真实启动器**创建一个长命进程(并确认它确实起来了、启动器 exit 0),
 前后枚举可见控制台窗口**数量不变**。用户侧 `restart-dsh-web.ps1` 的 WMI 转交有同一问题,已同样修复。
 
-遗留可见窗口:全部属于同一个 Windows Terminal 进程(pid 23444),其**子进程为空**
+遗留可见窗口:全部属于同一个 Windows Terminal 进程(pid 23444 —— 该次运行时的进程号,机器重启后会变),其**子进程为空**
 (标签页里的进程都已退出),且当前 DSH 的祖先链上没有它 —— 关掉不影响 DSH。
 
 ### 发现 F7 —— 重启按钮的禁用理由与实际前置条件不一致(Minor,已修)
@@ -327,6 +327,8 @@ class=CASCADIA_HOSTING_WINDOW_CLASS  title='C:\Program Files\nodejs\node.exe'
 **背景**:F5/F8/F9 的根因(重启竞态、宿主无控制台)由
 `docs/superpowers/specs/2026-09-12-resident-supervisor-design.md` 的**常驻看护进程**设计根治。
 本节记录该设计在真机上的验收。合并后 `main` = `5da4fb0`(18 个提交,本地快进、未推送)。
+
+**读法说明**:本节里的**进程号、窗口计数、启动时间**都是 **2026-09-12 当晚那一次运行**的实测值。机器重启后进程号必然不同,窗口计数也会随当时桌面上开着什么而变化 —— 请把它们当作那一次的现场记录,而不是可复现的常量。
 
 **验收方法**:两条启动形态各跑一遍,并在每条之后用 `EnumWindows` + `IsWindowVisible` + `GetClassName`
 枚举可见顶层窗口(命令执行前 / 执行一条 `cmd /c echo` 子进程并等 4 秒后各一次),看**新增窗口数**与
