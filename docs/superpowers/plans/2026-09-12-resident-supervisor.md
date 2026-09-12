@@ -37,6 +37,8 @@
 | `test/host-restart.test.js` | 修改 | launch-helper 的 argv 断言 |
 | `test/host-routes.test.js` | 修改 | 重启路由"接管者起不来则拒绝" |
 | `README.md` / `README.zh.md` | 修改 | 恢复章节改写(看护进程语义、隐身进程说明) |
+
+> 注(2026-09-12 夜):本节完成之后,仓库把 **中文版改为默认 `README.md`**、英文版移至 `README.en.md`;上表里的文件名按当时状态记录。
 | `docs/ACCEPTANCE.md` | 修改 | F5/F8/F9 标注"由本设计根治" |
 
 每个任务结束都是一个可独立验收的交付物;任务边界取"一个 reviewer 可能只否掉其中一个"的地方。
