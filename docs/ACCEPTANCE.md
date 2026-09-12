@@ -141,13 +141,16 @@ $r = ([wmiclass]'Win32_Process').Create('<cmdline>', $null, $startup)
 遗留可见窗口:全部属于同一个 Windows Terminal 进程(pid 23444),其**子进程为空**
 (标签页里的进程都已退出),且当前 DSH 的祖先链上没有它 —— 关掉不影响 DSH。
 
-### 发现 F7 —— 重启按钮的禁用理由与实际前置条件不一致(Minor,未修)
+### 发现 F7 —— 重启按钮的禁用理由与实际前置条件不一致(Minor,已修)
 
-`client.js:178` 的禁用条件是 `state.autostartEnabled` 为假就禁用,但**路由的真实前置条件是
+`client.js:178` 的禁用条件原本是 `state.autostartEnabled` 为假就禁用,但**路由的真实前置条件是
 `config.json` 存在**。于是"自启已停用、但 `config.json` 仍在"时,按钮是灰的、提示却在说
 "需要先由它生成 config.json" —— 而那个文件确实存在(本次验收收尾时正处于这个状态:卡片显示
-`开机自启: 未启用` 并要求启用,但重启其实是可用的)。建议按 `config.json` 是否存在来禁用,
-或让提示文案与真实条件一致。
+`开机自启: 未启用` 并要求启用,但重启其实是可用的)。
+
+**修复(`850f28f fix: gate the Restart button on config.json, not on the autostart entry`)**:禁用条件改为
+`state.configExists === false`(`client.js:178-183`,并留了注释说明为什么不按 `autostartEnabled` 判),
+与路由的真实前置条件一致。**待用户刷新页面做视觉确认**(见文末「结论」)。
 
 ### 发现 F8 —— 一键重启后 DSH 再没起来(重启竞态;已修)
 
@@ -191,18 +194,20 @@ socket 有机会消失;持续应答者仍会被判为外来服务并拒绝启动
 > **实现位置(常驻看护进程落地后仍然如此)**:这段重试就是 `service.js` 的 `waitForFreePort`,由
 > `runSupervise` 在两处调用 —— 启动前的端口探测,以及重试循环里每次 `attempt > 1`(或带 `--takeover`)
 > 之前的再探测。现行日志文案是 `port <port> is served by something else after waiting 3000ms;
-> standing down`(探测前后重新起一次)与 `port <port> still answers after waiting for it to drain;
+> standing down`(探测前的那次)与 `port <port> still answers after waiting for it to drain;
 > standing down`(重试循环里的那次)—— 前者下"外来服务"的结论,后者只说"它还在应答",不冒充结论。
 
-**已验证**:① 新增两条单元测试(重试后启动 / 持续占用仍拒绝,全套 125/125 通过);
+**已验证**:① 新增两条单元测试(重试后启动 / 持续占用仍拒绝,**当时**全套 125/125 通过 —— 这是本节
+最初写下时的数字,当天记录,不是当前套件规模);
 ② **真实 socket** 双向复核 —— 端口被占 1.6 秒后自行释放 → 重试到 1.6s 后成功启动;
 端口持续占用 → 13 次探测 / 3.0 秒后拒绝启动。
 
 > **未修(放大器)**:`index.js:549` 在**结果尚不可知**时就回 `202 {accepted:true}`,而看护进程最终放弃
 > 启动时**没有任何面向用户的反馈** —— 于是这类失败仍然是"静默变砖":用户只看到转圈。建议把结局
 > (已启动 / 已跳过 / 失败)写成卡片可读的状态。
-> (看护进程把窗口收窄了:失败会在 5 分钟内以 `giving up: DSH did not come up after N attempt(s); supervisor
-> exiting` 结束,而不是无限期转圈;但"给用户一条可见的结论"仍然没做。)
+> (看护进程把窗口收窄了:失败会在 5 分钟预算(再加上最后一次尝试自己的 `startTimeoutMs`)内以
+> `giving up: DSH did not come up after N attempt(s); supervisor exiting` 结束,而不是无限期转圈;
+> 但"给用户一条可见的结论"仍然没做。)
 
 > **由 `docs/superpowers/specs/2026-09-12-resident-supervisor-design.md` 根治。** 重启不再经 WMI 助手:
 > 由常驻看护进程按需接管,接管者起不来就当场拒绝重启、DSH 保持不动。
@@ -293,7 +298,7 @@ class=CASCADIA_HOSTING_WINDOW_CLASS  title='C:\Program Files\nodejs\node.exe'
 | M7 卸载清理 | **已在真实注册表上验证** | 同上三条分支;未从 UI 卸载(agent 无浏览器),但 `dispose → cleanupAutostart` 已在真机触发并被观测 |
 | F4 `reg.exe` stderr 噪音 | **已修** | `defaultExec` 改为 `stdio: ['ignore','pipe','ignore']`。它不只是日志噪音 —— **实测会直接出现在用户的 DSH 控制台里**(每次状态轮询一行;用户截图里那两句 `错误: 系统找不到指定的注册表项或值。` 就是它)。真实验证:调用真实 `readRunValue` 时 stderr 为空 |
 | F6 可见控制台窗口(M4/M6) | **已修**(`bf85b09`) | 见发现 F6;修复后用真实启动器复测,可见控制台窗口数量不变,实际重启时 3 → 2 且无新增 |
-| F7 重启按钮禁用理由不符 | **未修**(Minor,待定) | 见发现 F7 |
+| F7 重启按钮禁用理由不符 | **已修**(`850f28f`) | 禁用条件改为 `state.configExists === false`(`client.js:178-183`),与路由的真实前置条件一致;**待用户刷新页面视觉确认** |
 
 **关于 F3 在 `link:` 安装下的行为(有意为之)**:`link:` 安装卸载后仓库仍在,`service.js` 依然存在,
 条目会被**保留** —— 而那条自启此时**仍然可用**,保留是合理的;真正会留下死条目的是
@@ -303,7 +308,7 @@ class=CASCADIA_HOSTING_WINDOW_CLASS  title='C:\Program Files\nodejs\node.exe'
 
 - 插件的 **挂载层** 与 **四条写路由** 在真机 `0.1.5-rc.1` 上**全部工作**,包括它存在的理由
   (助手在宿主退出后仍然存活并拉起新实例、`accessUrl` 随新 token 刷新)。
-- 验收中发现的 **F2/F3/F4/F6 四项已修复并验证**;F7 已修(待用户刷新页面视觉确认);无其他待定项。
+- 验收中发现的 **F2/F3/F4/F6 四项已修复并验证**;F7 已修(`850f28f`,禁用条件改用 `configExists`)、待用户刷新页面视觉确认;无其他待定项。
 - **三个"需人工"项的状态**:
   1. **卡片是否出现、内容是否正确 → 已通过**(用户截图确认:标题、服务状态、访问地址、复制按钮、
      免责声明行都在,且访问地址是当前有效 token);

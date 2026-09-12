@@ -203,14 +203,16 @@ command-line. Work down this list.
 DSH is started by the **resident supervisor** — the login autostart entry *is* the supervisor, so it is always there
 when DSH is supposed to be. When a new instance does not come up, the supervisor does not simply give up:
 
-1. It **retries in place**, with the interval growing 1s → 1.5s → 2.25s → …, up to **5 attempts** and a total
-   **5-minute** budget. Each attempt waits `startTimeoutMs` (30s by default). It only retries once the failed child
-   is **really gone** — while one is still alive it will not start a competitor for the same port.
+1. It **retries in place**, with the interval growing 1s → 1.5s → 2.25s → …, up to **5 attempts** and a
+   **5-minute budget**. Each attempt also waits `startTimeoutMs` (30s by default) for the port — so the budget plus
+   the final attempt's own wait is the longest you can be waiting, and the loop normally ends earlier than the
+   budget. It only retries once the failed child is **really gone** — while one is still alive it will not start a
+   competitor for the same port.
 2. Nothing is scheduled for later: **the supervisor itself outlives the attempt**, so the retry happens inside the
    one process that is already watching the port.
 
-So after a failure, **wait a few minutes before intervening by hand** — the whole retry budget is 5 minutes at most.
-The supervisor says what it is doing:
+So after a failure, **wait a few minutes before intervening by hand** — the budget is 5 minutes, plus the last
+attempt's `startTimeoutMs`. The supervisor says what it is doing:
 
 ```
 spawned dsh pid=… (attempt 2/5)                        # retrying
@@ -265,11 +267,15 @@ and its stdout is written to `~/.dsh/dsh-autostart/dsh-web-server.log` — on su
 
 #### If you would rather run the CLI directly
 
-`node service.js start --config <absolute path to config.json>` does the same thing, but it ties DSH's life to the
-console you ran it from. DSH is spawned **attached**, so closing that window terminates DSH — and the supervisor stays
-in the foreground until DSH exits. If you use this form, leave the window open for as long as you want DSH up;
-otherwise prefer the `bootstrap.vbs` form above, which gives the supervisor its own hidden console and returns
-immediately.
+```
+node "<path to the plugin>\service.js" start --config "<absolute path to config.json>"
+```
+
+Both paths must be absolute (a bare `service.js` only resolves if your shell's cwd happens to be the plugin
+directory). This does the same thing as the `bootstrap.vbs` form, but it ties DSH's life to the console you ran it
+from: DSH is spawned **attached**, so closing that window terminates DSH — and the supervisor stays in the foreground
+until DSH exits. If you use this form, leave the window open for as long as you want DSH up; otherwise prefer the
+`bootstrap.vbs` form above, which gives the supervisor its own hidden console and returns immediately.
 
 ### 3) If `config.json` does not exist at all
 
@@ -332,7 +338,7 @@ current command is captured.
 ## Why it is built this way
 
 - **Why `wscript.exe` instead of `powershell -WindowStyle Hidden`**: the latter is unreliable for long-running scripts and leaves an empty console window that cannot be closed.
-- **Why waiting for the port uses conditional polling instead of a fixed `Start-Sleep`**: a fixed wait once made a single restart take over 80 seconds; conditional polling (`waitForPort`, 250ms apart, bounded by `startTimeoutMs`) brought it down to a few seconds. The supervisor does **not** poll the DSH process itself — it holds the child handle and waits for its `exit` event.
+- **Why waiting for the port uses conditional polling instead of a fixed `Start-Sleep`**: a fixed wait once made a single restart take over 80 seconds; conditional polling (`waitForPort`, 250ms apart, bounded by `startTimeoutMs`) brought it down to a few seconds. The supervisor does **not** poll the DSH process it owns — it holds that child's handle and waits for its `exit` event. (Pids are still polled where there is no handle to hold: waiting for the outgoing DSH to exit on a takeover, and waiting for a new supervisor to claim `supervise.pid`.)
 - **Why the port check uses a TCP connection instead of a `netstat`/`:port` substring**: substring matching also hits `TIME_WAIT` and client connections, so it reported "already running" when nothing had actually started.
 - **Why the logic is Node rather than PowerShell**: Chinese text in PowerShell scripts tends to hit encoding problems, and execution policy gets in the way.
 - **Why `--no-open` is mandatory**: DSH `0.1.2-rc.1` mints a new token on every start and prints the access URL to stdout; the plugin captures it into the log and shows it in the settings page, so opening a browser at boot is neither needed nor wanted.

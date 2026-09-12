@@ -58,7 +58,7 @@ window.__ModuleLoader__.load({
       'card.unsupported': '仅支持 Windows',
       'card.loadFailed': '无法读取插件状态',
       'card.loading': '正在读取状态…',
-      'card.restartNeedsAutostart': '请先启用开机自启:需要先由它生成 config.json,重启助手才能工作',
+      'card.restartNeedsAutostart': '请先启用开机自启:重启需要先有 config.json,看护进程才能按它拉起 DSH',
       'card.disclaimer': '⚠️ 重启会中断正在进行的任务,未落盘的对话可能丢失。详见免责声明。',
     }
     const en = {
@@ -85,7 +85,7 @@ window.__ModuleLoader__.load({
       'card.unsupported': 'Windows only',
       'card.loadFailed': 'Could not read plugin state',
       'card.loading': 'Reading state…',
-      'card.restartNeedsAutostart': 'Enable autostart first: its config.json is what the restart helper reads',
+      'card.restartNeedsAutostart': 'Enable autostart first: the restart needs config.json, which is what the supervisor reads to bring DSH back',
       'card.disclaimer': '⚠️ Restarting interrupts running tasks; unsaved conversation may be lost. See the disclaimer.',
     }
 

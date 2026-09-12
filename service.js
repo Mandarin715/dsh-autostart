@@ -68,11 +68,13 @@ export function readConfig(configPath) {
 /**
  * Environment for the replacement DSH instance.
  *
- * The helper is created by the WMI service, which does NOT pass on the caller's
- * environment, so the replacement would otherwise start without DSH_HOME and —
- * for anyone using a non-default home — against the wrong one. The home captured
- * at enable time (config.json) is re-asserted here. When nothing was captured the
- * base environment is returned untouched, so an older config keeps working.
+ * On the on-demand path the supervisor is created by the WMI service, which does
+ * NOT pass on the caller's environment, so the replacement would otherwise start
+ * without DSH_HOME and — for anyone using a non-default home — against the wrong
+ * one. (The login path has no such boundary, but this function does not need to
+ * know which one it is on.) The home captured at enable time (config.json) is
+ * re-asserted here. When nothing was captured the base environment is returned
+ * untouched, so an older config keeps working.
  */
 export function dshEnv(config, base = process.env) {
   const home = config?.dshHome
@@ -124,7 +126,7 @@ export function spawnDsh(config, log = () => {}, deps = {}) {
     env: dshEnv(config, deps.baseEnv ?? process.env),
   })
   // A bad execPath emits 'error'; with no listener Node rethrows it as an
-  // uncaught exception, killing this hidden login helper before it can report
+  // uncaught exception, killing this hidden login supervisor before it can report
   // anything. Swallow it into the log and let the port wait below surface the
   // failure as "did not come up".
   child.once('error', (error) => {
@@ -218,9 +220,9 @@ export function runHook(config, log, deps = {}) {
  * The probe is retried over a bounded window rather than trusted once. Measured
  * 2026-09-12 (docs/ACCEPTANCE.md, "restart race"): the outcome turns on a few milliseconds
  * after the old host is confirmed gone. On one run a single probe fired 4ms after the exit,
- * answered "busy", and the helper logged "skip start" and returned without starting
- * anything — DSH stayed down and the user saw only "reconnecting". On two later runs of the
- * same code the probe fired at +10ms and +9ms, answered "free", and the restart worked.
+ * answered "busy", and the then-current one-shot path logged "skip start" and returned without
+ * starting anything — DSH stayed down and the user saw only "reconnecting". On two later runs of
+ * the same code the probe fired at +10ms and +9ms, answered "free", and the restart worked.
  *
  * What answered at +4ms was not captured (the acceptance note records what was and was not
  * observed); the practical reading is that a probe landing the instant after a process dies
@@ -484,7 +486,7 @@ function makeLogger(config) {
  */
 export async function main(argv, deps = {}) {
   const mode = argv[2]
-  // An explicit --config is how the restart helper is told where config.json is:
+  // An explicit --config is how the on-demand supervisor is told where config.json is:
   // WMI creates it with the provider host's environment, so DSH_HOME is absent
   // and resolveDshHome() would point at the wrong home entirely.
   const configFlag = argv.indexOf('--config')

@@ -62,7 +62,7 @@ export function countRunningAgents(agentsService) {
   return list.filter((agent) => agent?.status === 'running').length
 }
 
-/** How long to wait for the WMI launcher to finish creating the helper. */
+/** How long to wait for the WMI launcher to finish creating the on-demand supervisor. */
 const DEFAULT_LAUNCHER_TIMEOUT_MS = 15000
 
 /** Bounded tail of the launcher's stderr kept for diagnosing a launch failure. */
@@ -115,18 +115,21 @@ export function extractLaunchDetail(stderrTail, max = LAUNCH_DETAIL_MAX) {
 }
 
 /**
- * Start the detached helper that waits for this process to exit and then
- * restarts DSH — created OUTSIDE this process's Windows job object.
+ * Start the resident supervisor — created OUTSIDE this process's Windows job
+ * object, so it survives DSH's exit and can bring DSH back.
  *
  * Node's `spawn(..., { detached: true })` is NOT sufficient: `detached` sets
- * DETACHED_PROCESS but not CREATE_BREAKAWAY_FROM_JOB, so the helper stays a
+ * DETACHED_PROCESS but not CREATE_BREAKAWAY_FROM_JOB, so the supervisor stays a
  * member of DSH's job object, which is created kill-on-close. DSH exiting would
- * then kill the helper before it could start the replacement — i.e. "restart"
+ * then kill it before it could start the replacement — i.e. "restart"
  * would silently mean "shut down". (Measured on a real DSH: a detached child is
  * still listed in the job's pid list, and killing the job kills it.)
  *
- * So the helper is created by the WMI service instead, which is not a DSH
- * descendant; what it creates is outside the job and survives DSH's exit.
+ * So this launch (the ON-DEMAND path only — at login `bootstrap.vbs` starts the
+ * supervisor directly, outside DSH) goes through the WMI service, which is not a
+ * DSH descendant; what it creates is outside the job and survives DSH's exit.
+ * What it is asked to run is `service.js supervise --takeover <pid>`, and it is
+ * the supervisor — not this function — that restarts DSH.
  *
  * The launch is AWAITED because the launcher itself runs inside the job: it has
  * to have completed the WMI call before the caller exits. Every failure path is
@@ -136,7 +139,7 @@ export async function defaultSpawnHelper(input, deps = {}) {
   // The existence checks stay first, so nothing is launched when a path is bad:
   // a missing path would otherwise surface only as an async CreateProcess error.
   if (!fs.existsSync(input.serviceJsPath)) {
-    throw new Error(`restart helper not found: ${input.serviceJsPath}`)
+    throw new Error(`service.js not found, so no supervisor can be started: ${input.serviceJsPath}`)
   }
   if (!fs.existsSync(input.execPath)) {
     throw new Error(`node executable not found: ${input.execPath}`)
@@ -414,8 +417,8 @@ export function createHandlers(deps) {
           `\uFEFF${renderBootstrap({
             execPath: command.execPath,
             serviceJsPath: deps.serviceJsPath ?? SERVICE_JS,
-            // Same reason as the restart path: the login helper must not re-derive
-            // the DSH home from an environment it may not have inherited.
+            // Same reason as the restart path: the supervisor started at login must not
+            // re-derive the DSH home from an environment it may not have inherited.
             configPath: configFilePath(dshHome),
           })}`,
           'utf16le',

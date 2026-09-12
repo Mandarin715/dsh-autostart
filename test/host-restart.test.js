@@ -301,7 +301,7 @@ test('defaultSpawnHelper rejects when the helper or node is missing', async () =
         spawnInput({ serviceJsPath: 'C:\\definitely\\missing\\service.js' }),
         deps,
       ),
-    /restart helper not found/,
+    /service\.js not found, so no supervisor can be started/,
   )
   await assert.rejects(
     () => defaultSpawnHelper(spawnInput({ execPath: 'C:\\definitely\\missing\\node.exe' }), deps),

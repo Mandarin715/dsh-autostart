@@ -605,7 +605,7 @@ export async function runSupervise(input) {
   log(`supervisor pid=${process.pid} watching ${config.dshPort}`)
 
   if (input.takeoverPid) {
-    log(`takeover: waiting for pid ${input.takeoverPid} to exit`)
+    log(`takeover: pid ${input.takeoverPid} must be gone before we start`)
     const waitExit = deps.waitForProcessExit ?? waitForProcessExit
     const gone = await waitExit(input.takeoverPid, { timeoutMs: deps.takeoverExitTimeoutMs ?? DEFAULT_TAKEOVER_EXIT_MS })
     if (!gone) {
@@ -976,22 +976,41 @@ Expected: FAIL(第一条:pid 文件被提前写下了;第二条若已通过说�
 
 - [ ] **Step 3: 实现**
 
-把 `runSupervise` 里接管失败的收尾改成**先清掉自己刚写的 pid 文件再返回**(当前实现已经如此,确认它真的执行),并把接管等待包在 `try/finally` 里以防抛出后残留 pid 文件:
+把 `runSupervise` 里接管失败的收尾改成**先清掉自己刚写的 pid 文件再返回**(当前实现已经如此,确认它真的执行),并把接管等待包在 `try` 里以防抛出后残留 pid 文件:
 
 ```js
   if (input.takeoverPid) {
-    log(`takeover: waiting for pid ${input.takeoverPid} to exit`)
+    // Stated as the precondition, not as an action, because service.log is the only diagnostic
+    // the user gets and the two shapes differ: a real `--takeover` genuinely waits here, while
+    // the re-entrant restart path short-circuits this wait (its child's 'exit' event already
+    // proved that pid is gone). "waiting for pid N to exit" would be false on that path.
+    log(`takeover: pid ${input.takeoverPid} must be gone before we start`)
     const waitExit = deps.waitForProcessExit ?? waitForProcessExit
-    const gone = await waitExit(input.takeoverPid, {
-      timeoutMs: deps.takeoverExitTimeoutMs ?? DEFAULT_TAKEOVER_EXIT_MS,
-    })
-    if (!gone) {
-      log(`takeover: pid ${input.takeoverPid} is still alive; standing down without starting`)
+    try {
+      const gone = await waitExit(input.takeoverPid, { timeoutMs: deps.takeoverExitTimeoutMs ?? DEFAULT_TAKEOVER_EXIT_MS })
+      if (!gone) {
+        log(`takeover: pid ${input.takeoverPid} is still alive; standing down without starting`)
+        ;(deps.clearFile ?? clearFile)(pidFile)
+        return { supervised: false, reason: 'takeover-timeout' }
+      }
+    } catch (error) {
+      // Catch, never `finally`: this process wrote pidFile before entering the wait, so a wait
+      // that throws must not leave it pointing at a supervisor that is exiting. A `finally`
+      // would also clear it on the success path below, where this process has just become the
+      // owner and the single-instance guard depends on it. The timeout path clears explicitly.
       ;(deps.clearFile ?? clearFile)(pidFile)
-      return { supervised: false, reason: 'takeover-timeout' }
+      throw error
     }
   }
 ```
+
+> **落地时的偏差(以本节代码为准)**
+> 1. 日志文案是**前提**而不是**动作**:`takeover: pid N must be gone before we start`(不是
+>    "waiting for pid N to exit")。原因在代码注释里:re-entrant 重启路径会短路这次等待(它的子进程
+>    `exit` 事件已经证明那个 pid 没了),那种情况下 "waiting…" 是假话,而 `service.log` 是用户唯一的
+>    诊断窗口。Task 10 Step 2 的验收清单必须按这个字符串找。
+> 2. 包的是 **`try`/`catch` 而非 `try`/`finally`**:`finally` 会在成功路径上把刚认领的 `pidFile` 也清掉,
+>    而单实例守卫正是靠它。超时路径显式清、抛出路径在 `catch` 里清(`service.js:297-311`)。
 
 - [ ] **Step 4: 运行,确认通过**
 
@@ -1324,7 +1343,15 @@ git commit -F /tmp/msg.txt   # "docs: describe the supervisor, its lifetime and 
 
 - [ ] **Step 2: 点一次「重启服务」**
 
-Expected: 页面数秒内恢复;**全程没有新窗口**;`service.log` 依次出现 `restart requested for pid=…`、`takeover: waiting for pid …`、`spawned dsh pid=…`、`port 3080 is up`。
+Expected: 页面数秒内恢复;**全程没有新窗口**;`service.log` 依次出现 ——
+
+- 看护进程**当时已在跑**(登录入口起的):`restart requested for pid=…` → `spawned dsh pid=…` →
+  `port 3080 is up`;
+- 看护进程**当时不在跑**(点重启时才按需拉起,Task 10 Step 4 就是这一条):`supervisor pid=… watching 3080`
+  → `takeover: pid … must be gone before we start` → `spawned dsh pid=…` → `port 3080 is up`。
+
+不要去找 `takeover: waiting for pid …`:那行字符串**不存在**(见 Task 6 的落地偏差 —— 等待是前提,不是动作;
+re-entrant 路径会短路它)。
 
 - [ ] **Step 3: 停用自启后 DSH 仍在跑**
 
