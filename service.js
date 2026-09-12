@@ -95,6 +95,12 @@ export function dshEnv(config, base = process.env) {
  * function may only be called by a process that stays alive for DSH's whole lifetime —
  * the supervisor.
  *
+ * Returns the ChildProcess handle, not its pid. The caller is the process that has to
+ * outlive DSH, and it learns of DSH's exit from that handle's 'exit' event — the spec is
+ * explicit that the host's liveness is judged by `child.on('exit')` and not by polling. A
+ * pid cannot carry that: once the child is gone the pid says nothing, and a recycled one
+ * would say the opposite of the truth.
+ *
  * TODO(Task 7): the one-shot `start` path still calls this from a helper that exits
  * immediately, so that contract is violated by this file's own caller until the CLI is
  * moved onto the supervisor.
@@ -126,7 +132,12 @@ export function spawnDsh(config, log = () => {}, deps = {}) {
   // Deliberately NOT child.unref(): with `detached: false` the child's life is governed by
   // the console it is attached to, not by this handle, so unref would be inert — and its
   // old "the child outlives us" meaning is exactly what the contract above forbids.
-  return child.pid
+  //
+  // The handle is returned, not `child.pid`, because the supervisor must learn that DSH exited
+  // from the handle's 'exit' event rather than by polling the pid (spec §"判断宿主死活用
+  // child.on('exit')，不轮询"). Holding the handle is what makes that possible; the pid alone
+  // cannot distinguish "still running" from "exited and recycled".
+  return child
 }
 
 /** Pick the interpreter for a hook script by extension. */
@@ -258,7 +269,7 @@ export async function runStart(input) {
   let pid = null
   let up = false
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    pid = spawnImpl(config, log, deps)
+    pid = spawnImpl(config, log, deps).pid
     log(`spawned dsh pid=${pid}${attempt > 1 ? ` (attempt ${attempt}/${attempts})` : ''}`)
     up = await wait(config.dshPort, { timeoutMs: config.startTimeoutMs })
     if (up) {
@@ -384,14 +395,15 @@ export async function runSupervise(input) {
         break
       }
     }
-    pid = spawnImpl(config, log, deps)
+    const child = spawnImpl(config, log, deps)
+    pid = child.pid
     spawned = attempt
     log(`spawned dsh pid=${pid}${attempt > 1 ? ` (attempt ${attempt}/${attempts})` : ''}`)
     const up = await wait(config.dshPort, { timeoutMs: config.startTimeoutMs })
     if (up) {
       log(`port ${config.dshPort} is up`)
       await hook(config, log, deps)
-      return await superviseChild({ config, configPath, log, deps, pid, requestFile, stopFile, pidFile })
+      return await superviseChild({ config, configPath, log, deps, pid, child, requestFile, stopFile, pidFile })
     }
     log(`WARN port ${config.dshPort} did not come up in time (attempt ${attempt}/${attempts})`)
     if (isAlive(pid)) {
@@ -418,22 +430,28 @@ export async function runSupervise(input) {
  * stop is worse than a service that occasionally does not come back.
  */
 async function superviseChild(input) {
-  const { config, configPath, log, pid, requestFile, stopFile, pidFile } = input
+  const { config, configPath, log, pid, child, requestFile, stopFile, pidFile } = input
   const deps = input.deps ?? {}
-  const waitExit = deps.waitForChildExit ?? ((childPid) => new Promise((resolve) => {
-    const tick = () => {
-      if (!defaultIsAlive(childPid)) resolve(childPid)
-      else setTimeout(tick, 500)
+  const waitExit = deps.waitForChildExit ?? ((childPid, childHandle) => new Promise((resolve) => {
+    // The handle, not the pid: an exit event cannot be confused by a recycled pid.
+    // The exitCode/signalCode guard is load-bearing. This listener is attached only after
+    // runSupervise finished its port wait and the hook, so a child that died in that window
+    // has already emitted 'exit'; Node does not replay events, so a listener attached
+    // afterwards would never fire and the supervisor would wait forever on a dead child.
+    if (childHandle.exitCode !== null || childHandle.signalCode !== null) {
+      resolve(childPid)
+      return
     }
-    tick()
+    childHandle.once('exit', () => resolve(childPid))
   }))
   const consumed = deps.consumeRestartRequest ?? consumeRestartRequest
   const stopped = deps.isStopRequested ?? isStopRequested
   const clear = deps.clearFile ?? clearFile
 
   let current = pid
+  let currentChild = child
   for (;;) {
-    await waitExit(current)
+    await waitExit(current, currentChild)
     if (stopped(stopFile, process.pid)) {
       log('stop requested; supervisor exiting')
       clear(pidFile)
@@ -442,7 +460,7 @@ async function superviseChild(input) {
     if (!consumed(requestFile, current)) {
       log(`dsh pid=${current} exited without a restart request; nothing to do`)
       clear(pidFile)
-      return { supervised: true, pid: current }
+      return { supervised: true, pid: current, child: currentChild }
     }
     log(`restart requested for pid=${current}; starting a replacement`)
     // Re-run the start phase for one attempt; runSupervise's own guard is skipped because
@@ -460,6 +478,7 @@ async function superviseChild(input) {
       return { supervised: false, reason: 'restart-failed' }
     }
     current = next.pid
+    currentChild = next.child
   }
 }
 

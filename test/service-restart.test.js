@@ -15,6 +15,19 @@ function baseConfig(overrides = {}) {
   }
 }
 
+// A stand-in for the ChildProcess handle spawnDsh returns (it returns the handle, not the pid,
+// so the supervisor can learn of the exit by event). See service-start.test.js for the fuller
+// helper; this file only needs the pid and the `once`/`unref` shape spawnDsh touches.
+function fakeChild(pid) {
+  return {
+    pid,
+    exitCode: null,
+    signalCode: null,
+    once() { return this },
+    unref() {},
+  }
+}
+
 test('waitForProcessExit returns true as soon as the pid is gone', async () => {
   let calls = 0
   const alive = await waitForProcessExit(1, {
@@ -56,7 +69,7 @@ test('runRestart waits for exit, then starts and hooks', async () => {
       },
       spawnDsh: () => {
         order.push('spawn')
-        return 555
+        return fakeChild(555)
       },
       runHook: async () => {
         order.push('hook')

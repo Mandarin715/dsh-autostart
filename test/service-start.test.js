@@ -6,6 +6,46 @@ import path from 'node:path'
 import { runStart, runSupervise, runHook, spawnDsh, scheduleSecondChance, main } from '../service.js'
 import { readPid, writePid, writeRestartRequest } from '../lib/supervise-state.js'
 
+// A stand-in for the ChildProcess handle spawnDsh returns. `once` records subscriptions so a
+// test can prove the supervisor listened for 'exit' instead of polling the pid.
+//
+// The default child exits on the next turn, because the default exit wait is now an event and a
+// handle that never emits would block the loop forever. That is the truth for the loop tests:
+// their child is a child that runs and then ends. Two other kinds are named explicitly:
+//   fakeChild(pid, { exit: false }) -- still running; the test fires it by hand with close().
+//   exitedChild(pid)               -- already dead before anyone could subscribe (no replay).
+function fakeChild(childPid, { exit = true } = {}) {
+  const child = {
+    pid: childPid,
+    exitCode: null,
+    signalCode: null,
+    subscriptions: [],
+    once(event, handler) {
+      this.subscriptions.push(event)
+      if (event === 'exit') {
+        this.onExit = handler
+        if (exit) setImmediate(() => this.close())
+      }
+      return this
+    },
+    close() {
+      this.exitCode = 0
+      this.onExit?.()
+    },
+  }
+  return child
+}
+
+// A handle for a child that died while runSupervise was still in its port wait or hook, so its
+// 'exit' event was emitted before anyone could subscribe — and Node never replays it. `once('exit')`
+// therefore records the subscription but never calls it, which is exactly the hang the
+// exitCode/signalCode guard in superviseChild exists to prevent.
+function exitedChild(childPid) {
+  const child = fakeChild(childPid, { exit: false })
+  child.exitCode = 0
+  return child
+}
+
 function baseConfig(overrides = {}) {
   return {
     schemaVersion: 1,
@@ -60,7 +100,7 @@ test('runStart retries the port probe so an early answer cannot abort the restar
       now: () => (clock += 100),
       sleep: async () => {},
       waitForPort: async () => true,
-      spawnDsh: () => 4242,
+      spawnDsh: () => fakeChild(4242),
       runHook: async () => ({ ran: false }),
     },
   })
@@ -111,7 +151,7 @@ test('runStart spawns, waits for the port, then runs the hook', async () => {
       },
       spawnDsh: () => {
         order.push('spawn')
-        return 4242
+        return fakeChild(4242)
       },
       runHook: async () => {
         order.push('hook')
@@ -131,7 +171,7 @@ test('runStart reports a failed port wait without throwing', async () => {
     deps: {
       isPortListening: async () => false,
       waitForPort: async () => false,
-      spawnDsh: () => 7,
+      spawnDsh: () => fakeChild(7),
       runHook: async () => ({ ran: false }),
     },
   })
@@ -250,7 +290,7 @@ test('runStart hands the logger to the spawner so a spawn failure is reportable'
       waitForPort: async () => true,
       spawnDsh: (config, log) => {
         receivedLog = log
-        return 11
+        return fakeChild(11)
       },
       runHook: async () => ({ ran: false }),
     },
@@ -400,7 +440,7 @@ test('runStart retries a start that never came up, once the failed child is gone
       waitForPort: async () => false,
       spawnDsh: () => {
         spawns += 1
-        return 1000 + spawns
+        return fakeChild(1000 + spawns)
       },
       isProcessAlive: () => false,
       startAttempts: 3,
@@ -428,7 +468,7 @@ test('runStart does not start a competitor while the failed child is still alive
       waitForPort: async () => false,
       spawnDsh: () => {
         spawns += 1
-        return 2000
+        return fakeChild(2000)
       },
       isProcessAlive: () => true,
       startAttempts: 3,
@@ -451,7 +491,7 @@ test('a failed start leaves exactly one delayed attempt behind', async () => {
     deps: {
       isPortListening: async () => false,
       waitForPort: async () => false,
-      spawnDsh: () => 3000,
+      spawnDsh: () => fakeChild(3000),
       isProcessAlive: () => false,
       startAttempts: 1,
       sleep: async () => {},
@@ -476,7 +516,7 @@ test('the delayed attempt itself never schedules another one (no loop)', async (
     deps: {
       isPortListening: async () => false,
       waitForPort: async () => false,
-      spawnDsh: () => 3000,
+      spawnDsh: () => fakeChild(3000),
       isProcessAlive: () => false,
       startAttempts: 1,
       sleep: async () => {},
@@ -543,6 +583,7 @@ test('runSupervise starts DSH once and reports that it is supervising', async ()
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup-'))
   try {
     const spawned = []
+    const child = fakeChild(4242)
     let hooked = 0
     const result = await runSupervise({
       config: baseConfig({ startTimeoutMs: 1000 }),
@@ -551,7 +592,7 @@ test('runSupervise starts DSH once and reports that it is supervising', async ()
       deps: {
         isPortListening: async () => false,
         waitForPort: async () => true,
-        spawnDsh: () => { spawned.push(1); return 4242 },
+        spawnDsh: () => { spawned.push(1); return child },
         runHook: async () => { hooked += 1; return { ran: false } },
         isProcessAlive: () => false,
         // Task 4 returns as soon as the port is up and the hook has run; the supervision loop
@@ -563,7 +604,12 @@ test('runSupervise starts DSH once and reports that it is supervising', async ()
     })
     assert.equal(spawned.length, 1)
     assert.equal(hooked, 1, 'the start phase ends by running the hook')
-    assert.deepEqual(result, { supervised: true, pid: 4242 })
+    // Explicit fields plus the handle's pid: the result gained a `child` key, so a deepEqual
+    // against the old shape would no longer pin the contract as strictly.
+    assert.equal(result.supervised, true)
+    assert.equal(result.pid, 4242)
+    assert.equal(result.child, child)
+    assert.equal(result.child.pid, 4242)
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
 
@@ -579,7 +625,7 @@ test('runSupervise retries a start that never came up, until the attempt limit',
       deps: {
         isPortListening: async () => false,
         waitForPort: async () => false,
-        spawnDsh: () => { spawns += 1; return 5000 + spawns },
+        spawnDsh: () => { spawns += 1; return fakeChild(5000 + spawns) },
         runHook: async () => ({ ran: false }),
         isProcessAlive: () => false,
         superviseAttempts: 3,
@@ -626,6 +672,7 @@ test('runSupervise waits out a draining socket instead of accepting the port as 
     const lines = []
     let probes = 0
     let spawns = 0
+    const child = fakeChild(4242, { exit: false })
     const result = await runSupervise({
       config: baseConfig({ startTimeoutMs: 10 }),
       configPath: path.join(dir, 'config.json'),
@@ -640,16 +687,23 @@ test('runSupervise waits out a draining socket instead of accepting the port as 
         now: (() => { let t = 0; return () => (t += 1000) })(),
         sleep: async () => {},
         waitForPort: async () => true,
-        spawnDsh: () => { spawns += 1; return 4242 },
+        spawnDsh: () => { spawns += 1; return child },
         runHook: async () => ({ ran: false }),
         isProcessAlive: () => false,
         takeoverPortWindowMs: 5000,
         portProbeIntervalMs: 1,
+        // This is the one Task 4 test that reaches the supervision loop. The exit is injected so
+        // the test does not also depend on the fake handle's own exit behaviour: here the child
+        // stays up (the loop is not what is under test), and the seam stands in for "it ended".
+        waitForChildExit: async (pid) => pid,
       },
     })
     assert.equal(probes, 2, 'the busy answer must be re-probed, not accepted once')
     assert.equal(spawns, 1, 'a draining socket must not stop the start')
-    assert.deepEqual(result, { supervised: true, pid: 4242 })
+    assert.equal(result.supervised, true)
+    assert.equal(result.pid, 4242)
+    assert.equal(result.child, child)
+    assert.equal(result.child.pid, 4242)
     assert.doesNotMatch(lines.join('\n'), /port-busy|standing down/)
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
@@ -698,7 +752,7 @@ test('runSupervise does not retry while the failed child is still alive', async 
       deps: {
         isPortListening: async () => false,
         waitForPort: async () => false,
-        spawnDsh: () => { spawns += 1; return 6000 },
+        spawnDsh: () => { spawns += 1; return fakeChild(6000) },
         isProcessAlive: () => true,
         runHook: async () => ({ ran: false }),
         superviseAttempts: 3,
@@ -729,7 +783,7 @@ test('runSupervise stops retrying once the total time budget is spent', async ()
       deps: {
         isPortListening: async () => false,
         waitForPort: async () => false,
-        spawnDsh: () => { spawns += 1; return 7000 },
+        spawnDsh: () => { spawns += 1; return fakeChild(7000) },
         isProcessAlive: () => false,
         runHook: async () => ({ ran: false }),
         superviseAttempts: 10,
@@ -769,7 +823,7 @@ test('runSupervise refuses to spawn a retry while the port still answers', async
         now: (() => { let t = 0; return () => (t += 1000) })(),
         sleep: async () => {},
         waitForPort: async () => false,
-        spawnDsh: () => { spawns += 1; return 8000 },
+        spawnDsh: () => { spawns += 1; return fakeChild(8000) },
         isProcessAlive: () => false,
         runHook: async () => ({ ran: false }),
         superviseAttempts: 2,
@@ -795,6 +849,8 @@ test('runSupervise restarts DSH only when the exit was requested', async () => {
     // First child (pid 111) exits with a matching restart request; second (222) exits with
     // none, which must end the loop without another spawn.
     writeRestartRequest(path.join(dir, 'restart.request'), 111)
+    const first = fakeChild(111)
+    const second = fakeChild(222)
     const result = await runSupervise({
       config: baseConfig({ startTimeoutMs: 10 }),
       configPath: path.join(dir, 'config.json'),
@@ -802,7 +858,7 @@ test('runSupervise restarts DSH only when the exit was requested', async () => {
       deps: {
         isPortListening: async () => false,
         waitForPort: async () => true,
-        spawnDsh: () => { spawns += 1; return spawns === 1 ? 111 : 222 },
+        spawnDsh: () => { spawns += 1; return spawns === 1 ? first : second },
         runHook: async () => ({ ran: false }),
         isProcessAlive: () => false,
         // The replacement start goes through runSupervise's takeover wait, which uses a
@@ -814,7 +870,10 @@ test('runSupervise restarts DSH only when the exit was requested', async () => {
       },
     })
     assert.equal(spawns, 2, 'the requested restart must respawn exactly once')
-    assert.deepEqual(result, { supervised: true, pid: 222 })
+    assert.equal(result.supervised, true)
+    assert.equal(result.pid, 222)
+    assert.equal(result.child, second)
+    assert.equal(result.child.pid, 222)
     assert.match(lines.join('\n'), /restart requested/)
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
@@ -824,6 +883,7 @@ test('runSupervise does not resurrect DSH when the exit was not requested', asyn
   try {
     const lines = []
     let spawns = 0
+    const child = fakeChild(777)
     const result = await runSupervise({
       config: baseConfig({ startTimeoutMs: 10 }),
       configPath: path.join(dir, 'config.json'),
@@ -831,7 +891,7 @@ test('runSupervise does not resurrect DSH when the exit was not requested', asyn
       deps: {
         isPortListening: async () => false,
         waitForPort: async () => true,
-        spawnDsh: () => { spawns += 1; return 777 },
+        spawnDsh: () => { spawns += 1; return child },
         runHook: async () => ({ ran: false }),
         isProcessAlive: () => false,
         waitForChildExit: async (pid) => pid,
@@ -839,7 +899,10 @@ test('runSupervise does not resurrect DSH when the exit was not requested', asyn
       },
     })
     assert.equal(spawns, 1, 'a plain exit is not a reason to start another instance')
-    assert.deepEqual(result, { supervised: true, pid: 777 })
+    assert.equal(result.supervised, true)
+    assert.equal(result.pid, 777)
+    assert.equal(result.child, child)
+    assert.equal(result.child.pid, 777)
     assert.match(lines.join('\n'), /exited without a restart request/)
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
@@ -856,7 +919,7 @@ test('runSupervise exits when a stop marker names this supervisor', async () => 
       deps: {
         isPortListening: async () => false,
         waitForPort: async () => true,
-        spawnDsh: () => { spawns += 1; return 555 },
+        spawnDsh: () => { spawns += 1; return fakeChild(555) },
         runHook: async () => ({ ran: false }),
         isProcessAlive: () => false,
         waitForChildExit: async (pid) => {
@@ -869,5 +932,70 @@ test('runSupervise exits when a stop marker names this supervisor', async () => 
     assert.equal(spawns, 1, 'a stop must not spawn a replacement')
     assert.equal(result.supervised, false)
     assert.match(lines.join('\n'), /stop requested/)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise learns of the exit from the child handle, not by polling the pid', async () => {
+  // The spec says it four times (design.md:46,:51,:80,:106) and the plan's architecture
+  // paragraph agrees (plan.md:7): liveness is judged by `child.on('exit')`, 不轮询. The pid
+  // alone cannot carry that, which is why spawnDsh returns the handle.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup7-'))
+  try {
+    const child = fakeChild(4242, { exit: false })
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 10 }),
+      configPath: path.join(dir, 'config.json'),
+      log: () => {},
+      deps: {
+        isPortListening: async () => false,
+        waitForPort: async () => true,
+        spawnDsh: () => child,
+        runHook: async () => {
+          // Fires a turn after the handle exists, by which point the loop has subscribed. A
+          // handle that closed before anyone listened is the other test's scenario.
+          setImmediate(() => child.close())
+          return { ran: false }
+        },
+        isProcessAlive: () => false,
+        // waitForChildExit is deliberately NOT injected: this test exists to cover the default
+        // branch, which is the only one in the change with no other test over it.
+      },
+    })
+    assert.ok(
+      child.subscriptions.includes('exit'),
+      `the default must subscribe to the handle's 'exit' event, got: ${JSON.stringify(child.subscriptions)}`,
+    )
+    // The exit was delivered as an event, no restart was requested, so the story ends.
+    assert.equal(result.supervised, true)
+    assert.equal(result.pid, 4242)
+    assert.equal(result.child, child)
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('runSupervise does not hang when the child exited before the listener was attached', async () => {
+  // runSupervise only reaches superviseChild after waitForPort and the hook have run, so a child
+  // that died in that window already emitted 'exit' — and Node does not replay events. Without
+  // the exitCode/signalCode guard the loop would wait forever on a dead child while still holding
+  // supervise.pid, which also blocks the single-instance guard. This is a regression pin for that
+  // hang, not a mechanism RED: it passes against the old polling default too, because a fake pid
+  // that does not exist makes defaultIsAlive report "gone".
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup8-'))
+  try {
+    const child = exitedChild(4242)
+    const result = await runSupervise({
+      config: baseConfig({ startTimeoutMs: 10 }),
+      configPath: path.join(dir, 'config.json'),
+      log: () => {},
+      deps: {
+        isPortListening: async () => false,
+        waitForPort: async () => true,
+        spawnDsh: () => child,
+        runHook: async () => ({ ran: false }),
+        isProcessAlive: () => false,
+      },
+    })
+    assert.equal(result.supervised, true)
+    assert.equal(result.pid, 4242)
+    assert.equal(readPid(path.join(dir, 'supervise.pid')), null, 'an ended story must not leave its pid behind')
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
