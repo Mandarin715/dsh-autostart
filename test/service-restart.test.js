@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { waitForProcessExit, runRestart, defaultIsAlive, main } from '../service.js'
+import { waitForProcessExit, defaultIsAlive, main } from '../service.js'
 
 function baseConfig(overrides = {}) {
   return {
@@ -12,19 +12,6 @@ function baseConfig(overrides = {}) {
     waitForExitMs: 500,
     logPaths: { out: 'out.log', err: 'err.log', service: 'service.log' },
     ...overrides,
-  }
-}
-
-// A stand-in for the ChildProcess handle spawnDsh returns (it returns the handle, not the pid,
-// so the supervisor can learn of the exit by event). See service-start.test.js for the fuller
-// helper; this file only needs the pid and the `once`/`unref` shape spawnDsh touches.
-function fakeChild(pid) {
-  return {
-    pid,
-    exitCode: null,
-    signalCode: null,
-    once() { return this },
-    unref() {},
   }
 }
 
@@ -51,58 +38,80 @@ test('waitForProcessExit returns false on timeout', async () => {
   assert.equal(gone, false)
 })
 
-test('runRestart waits for exit, then starts and hooks', async () => {
-  const order = []
-  const result = await runRestart({
-    config: baseConfig(),
-    oldPid: 999,
-    log: () => {},
+test('main treats start as an alias for supervise so existing installs keep working', async () => {
+  // bootstrap.vbs is generated at enable time and snapshots `service.js start --config …`,
+  // so an upgrade must not require the user to re-enable autostart.
+  const calls = []
+  await main(['node', 'service.js', 'start'], {
+    configPath: 'test/fixtures/config.json',
+    runSupervise: async (input) => {
+      calls.push(input)
+      return { supervised: true, pid: 1 }
+    },
+    // Nested: `deps` is the seam bag main forwards to the mode implementation. The guard is
+    // refused so a regression that reached the real supervisor could not poll the live port
+    // (127.0.0.1:3080) for the whole 3000ms probe window before this test failed.
+    deps: { anotherSupervisorAlive: () => true },
+  })
+  assert.equal(calls.length, 1)
+  // The requested config path is what main resolved and handed over, not a re-derived home.
+  assert.equal(calls[0].configPath, 'test/fixtures/config.json')
+  assert.equal(calls[0].takeoverPid, null, 'a bare start asks for no takeover')
+})
+
+test('main resolves supervise as the real entry point', async () => {
+  // The other half of the alias: naming the mode explicitly must reach the same function.
+  // `--takeover <pid>` is parsed here rather than in the alias test, because that is the shape
+  // the launch helper actually generates and the flag is new in this task.
+  const calls = []
+  await main(['node', 'service.js', 'supervise', '--takeover', '4321'], {
+    configPath: 'test/fixtures/config.json',
+    runSupervise: async (input) => {
+      calls.push(input)
+      return { supervised: true, pid: 1 }
+    },
+    deps: { anotherSupervisorAlive: () => true },
+  })
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].takeoverPid, 4321)
+})
+
+test('main refuses a --takeover that is not a positive integer', async () => {
+  // The value reaches runSupervise and then a pid wait, so a malformed one must be refused
+  // rather than coerced. Number('421x') is NaN and a negative pid is nonsense.
+  for (const bad of ['abc', '0', '-1', '1.5']) {
+    let called = false
+    const code = await main(['node', 'service.js', 'supervise', '--takeover', bad], {
+      configPath: 'test/fixtures/config.json',
+      runSupervise: async () => {
+        called = true
+        return { supervised: true, pid: 1 }
+      },
+      deps: { anotherSupervisorAlive: () => true },
+    })
+    assert.equal(code, 2, `expected --takeover ${bad} to be refused`)
+    assert.equal(called, false, 'a refused --takeover must not reach the supervisor')
+  }
+})
+
+test('main rejects the removed restart mode', async () => {
+  // `restart --pid <n>` was the WMI-relay contract; supervise with --takeover replaced it.
+  // Refusing loudly beats silently doing nothing, which would leave DSH down with no clue.
+  //
+  // The pid below is a placeholder from the brief and the mode must be refused before anything
+  // can wait on it: this test may never depend on the liveness of a real pid (pid 5 is the
+  // Windows idle process, i.e. always "alive"), or a regression would poll the machine's
+  // process table for the whole waitForExitMs instead of failing on the exit code. That is the
+  // failure mode this test exists to catch, so the seam is poisoned to make it unreachable.
+  const code = await main(['node', 'service.js', 'restart', '--pid', '5'], {
+    configPath: 'test/fixtures/config.json',
     deps: {
       waitForProcessExit: async () => {
-        order.push('waitExit')
-        return true
-      },
-      isPortListening: async () => false,
-      waitForPort: async () => {
-        order.push('waitPort')
-        return true
-      },
-      spawnDsh: () => {
-        order.push('spawn')
-        return fakeChild(555)
-      },
-      runHook: async () => {
-        order.push('hook')
-        return { ran: false }
+        throw new Error('restart must be refused before any pid is waited on')
       },
     },
   })
-  assert.deepEqual(order, ['waitExit', 'spawn', 'waitPort', 'hook'])
-  assert.deepEqual(result, { restarted: true, started: true, pid: 555, up: true })
-})
-
-test('runRestart aborts without spawning when the old process never exits', async () => {
-  const lines = []
-  const result = await runRestart({
-    config: baseConfig(),
-    oldPid: 999,
-    log: (line) => lines.push(line),
-    deps: {
-      waitForProcessExit: async () => false,
-      spawnDsh: () => {
-        throw new Error('must not spawn a second instance')
-      },
-    },
-  })
-  assert.deepEqual(result, { restarted: false })
-  assert.match(lines.join('\n'), /aborting restart/)
-})
-
-test('main rejects restart without a --pid', async () => {
-  const code = await main(['node', 'service.js', 'restart'], {
-    configPath: 'test/fixtures/config.json',
-  })
-  assert.equal(code, 2)
+  assert.equal(code, 2, 'restart is gone; refusing loudly beats silently doing nothing')
 })
 
 test('defaultIsAlive treats only ESRCH as gone', () => {

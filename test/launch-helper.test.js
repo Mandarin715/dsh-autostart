@@ -10,33 +10,33 @@ import {
 
 const CONFIG_PATH = 'C:\\Users\\a b\\.dsh\\dsh-autostart\\config.json'
 
-test('buildHelperCommandLine quotes each path and appends the restart arguments', () => {
+test('buildHelperCommandLine quotes each path and appends the supervise arguments', () => {
   const line = buildHelperCommandLine({
     execPath: 'C:\\Program Files\\nodejs\\node.exe',
     serviceJsPath: 'C:\\Users\\a b\\dsh-autostart\\service.js',
-    oldPid: 4321,
+    takeoverPid: 4321,
     configPath: CONFIG_PATH,
   })
   assert.equal(
     line,
-    '"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\a b\\dsh-autostart\\service.js" restart --pid 4321 --config "C:\\Users\\a b\\.dsh\\dsh-autostart\\config.json"',
+    '"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\a b\\dsh-autostart\\service.js" supervise --config "C:\\Users\\a b\\.dsh\\dsh-autostart\\config.json" --takeover 4321',
   )
 })
 
 test('buildHelperCommandLine refuses a pid that is not a positive integer', () => {
   // The pid is interpolated into a command line handed to the OS: a non-numeric
   // value must never reach it.
-  for (const oldPid of [Number.NaN, -1, 0, 1.5, '4321']) {
+  for (const takeoverPid of [Number.NaN, -1, 0, 1.5, '4321']) {
     assert.throws(
       () =>
         buildHelperCommandLine({
           execPath: 'node.exe',
           serviceJsPath: 'service.js',
-          oldPid,
+          takeoverPid,
           configPath: CONFIG_PATH,
         }),
-      /oldPid/,
-      `expected oldPid ${String(oldPid)} to be refused`,
+      /takeoverPid/,
+      `expected takeoverPid ${String(takeoverPid)} to be refused`,
     )
   }
 })
@@ -50,7 +50,7 @@ test('buildHelperCommandLine requires an explicit config path', () => {
   for (const configPath of [undefined, null, '']) {
     assert.throws(
       () =>
-        buildHelperCommandLine({ execPath: 'node.exe', serviceJsPath: 's.js', oldPid: 1, configPath }),
+        buildHelperCommandLine({ execPath: 'node.exe', serviceJsPath: 's.js', takeoverPid: 1, configPath }),
       /configPath/,
       `expected configPath ${String(configPath)} to be refused`,
     )
@@ -119,7 +119,7 @@ test('buildHelperCommandLine requires an absolute config path', () => {
       buildHelperCommandLine({
         execPath: 'node.exe',
         serviceJsPath: 's.js',
-        oldPid: 1,
+        takeoverPid: 1,
         configPath: 'relative\\config.json',
       }),
     /absolute/,

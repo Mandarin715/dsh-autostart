@@ -254,7 +254,7 @@ function spawnInput(overrides = {}) {
   return {
     execPath: process.execPath,
     serviceJsPath: import.meta.filename,
-    oldPid: 99,
+    takeoverPid: 99,
     configPath: 'C:\\dsh\\dsh-autostart\\config.json',
     ...overrides,
   }
@@ -310,7 +310,8 @@ test('defaultSpawnHelper launches the helper through the WMI service', async () 
     'base64',
   ).toString('utf16le')
   assert.match(script, /Win32_Process/)
-  assert.match(script, /restart --pid 99/)
+  assert.match(script, /supervise/)
+  assert.match(script, /--takeover 99/)
   // The helper must be told where config.json is: the WMI boundary drops the
   // caller's environment, so it cannot be allowed to re-derive DSH_HOME.
   assert.match(script, /--config/)

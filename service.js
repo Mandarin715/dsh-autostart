@@ -28,14 +28,9 @@ const SERVICE_JS = fileURLToPath(import.meta.url)
 
 // How long a port that keeps answering is re-probed before it is called another service's.
 // A port can still answer for an instant after the process that owned it dies, which is what
-// made a single probe unsafe right after a restart (see runStart).
+// made a single probe unsafe right after a restart (see waitForFreePort).
 const DEFAULT_PORT_PROBE_WINDOW_MS = 3000
 const DEFAULT_PORT_PROBE_INTERVAL_MS = 250
-
-// A start that never came up is retried this many times, with this pause, provided the
-// failed child is gone by then (see runStart).
-const DEFAULT_START_ATTEMPTS = 3
-const DEFAULT_START_RETRY_DELAY_MS = 3000
 
 // How long the single last-resort attempt waits before trying again (see
 // scheduleSecondChance). Long enough for a slow first start, a busy antivirus scan or a
@@ -212,12 +207,12 @@ export function runHook(config, log, deps = {}) {
 }
 
 /**
- * Start DSH unless the port already answers. Conditional polling only.
+ * Wait, briefly, for the port to stop answering before spawning a replacement.
  *
  * The probe is retried over a bounded window rather than trusted once. Measured
  * 2026-09-12 (docs/ACCEPTANCE.md, "restart race"): the outcome turns on a few milliseconds
- * after the old host is confirmed gone. On one run the single probe fired 4ms after the
- * exit, answered "busy", and the helper logged "skip start" and returned without starting
+ * after the old host is confirmed gone. On one run a single probe fired 4ms after the exit,
+ * answered "busy", and the helper logged "skip start" and returned without starting
  * anything — DSH stayed down and the user saw only "reconnecting". On two later runs of the
  * same code the probe fired at +10ms and +9ms, answered "free", and the restart worked.
  *
@@ -228,79 +223,6 @@ export function runHook(config, log, deps = {}) {
  * knowing which of the two it was: a draining socket clears, while a genuinely foreign
  * listener keeps answering and the window expires exactly as before.
  */
-export async function runStart(input) {
-  const { config, log } = input
-  const deps = input.deps ?? {}
-  const probe = deps.isPortListening ?? isPortListening
-  const wait = deps.waitForPort ?? waitForPort
-  const spawnImpl = deps.spawnDsh ?? spawnDsh
-  const hook = deps.runHook ?? runHook
-  const now = deps.now ?? Date.now
-  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
-  const isAlive = deps.isProcessAlive ?? defaultIsAlive
-  const attempts = deps.startAttempts ?? DEFAULT_START_ATTEMPTS
-  const retryDelayMs = deps.startRetryDelayMs ?? DEFAULT_START_RETRY_DELAY_MS
-  const schedule =
-    deps.scheduleSecondChance ?? (input.configPath ? scheduleSecondChance : null)
-
-  const windowMs = deps.portProbeWindowMs ?? DEFAULT_PORT_PROBE_WINDOW_MS
-  const intervalMs = deps.portProbeIntervalMs ?? DEFAULT_PORT_PROBE_INTERVAL_MS
-  const deadline = now() + windowMs
-  let probes = 0
-  for (;;) {
-    probes += 1
-    if (!(await probe(config.dshPort))) break
-    if (now() >= deadline) {
-      log(
-        `port ${config.dshPort} still answering after ${probes} probes (${windowMs}ms); ` +
-          'assuming another service owns it; skip start',
-      )
-      // A busy port at login usually means something else is already serving DSH, and a
-      // fallback would be an attempt to fight it. After a restart it means our own instance
-      // just died and something is lingering, which is the case worth one more try.
-      if (input.afterRestart && schedule && !input.secondChance) {
-        await schedule({ configPath: input.configPath, config, log, deps })
-      }
-      return { started: false }
-    }
-    await sleep(intervalMs)
-  }
-
-  let pid = null
-  let up = false
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    pid = spawnImpl(config, log, deps).pid
-    log(`spawned dsh pid=${pid}${attempt > 1 ? ` (attempt ${attempt}/${attempts})` : ''}`)
-    up = await wait(config.dshPort, { timeoutMs: config.startTimeoutMs })
-    if (up) {
-      log(`port ${config.dshPort} is up`)
-      break
-    }
-    log(`WARN port ${config.dshPort} did not come up in time (attempt ${attempt}/${attempts})`)
-    if (attempt === attempts) break
-    // Retry only once the failed child is really gone: a live one may still bind the port a
-    // moment later, and starting a competitor at that point is how you end up with two DSH
-    // instances racing for the same port.
-    if (isAlive(pid)) {
-      log(`previous pid ${pid} is still alive; not starting a second instance`)
-      break
-    }
-    await sleep(retryDelayMs)
-  }
-
-  if (up) {
-    await hook(config, log, deps)
-    return { started: true, pid, up: true }
-  }
-  // DSH is down and nothing is holding the port. No UI can report this — the card lives
-  // inside the page that just went away — so leave one delayed attempt behind.
-  if (schedule && !input.secondChance) {
-    await schedule({ configPath: input.configPath, config, log, deps })
-  }
-  return { started: true, pid, up: false }
-}
-
-/** Wait, briefly, for the port to stop answering before spawning a replacement. */
 async function waitForFreePort(probe, port, log, deps = {}) {
   const windowMs = deps.takeoverPortWindowMs ?? DEFAULT_PORT_PROBE_WINDOW_MS
   const intervalMs = deps.portProbeIntervalMs ?? DEFAULT_PORT_PROBE_INTERVAL_MS
@@ -383,9 +305,10 @@ export async function runSupervise(input) {
     }
   } else if (!(await waitForFreePort(probe, config.dshPort, log, deps))) {
     // A bare single probe cannot tell a live foreign service from a socket the kernel has not
-    // released yet (measured 2026-09-12, see runStart), and standing down on a draining socket
-    // would exit reporting success while DSH is down. So the port is re-probed over the whole
-    // window and only a port that still answers afterwards is called someone else's.
+    // released yet (measured 2026-09-12, docs/ACCEPTANCE.md F8 "restart race"), and standing
+    // down on a draining socket would exit reporting success while DSH is down. So the port is
+    // re-probed over the whole window — waitForFreePort, above — and only a port that still
+    // answers afterwards is called someone else's.
     log(`port ${config.dshPort} is served by something else after waiting ${deps.takeoverPortWindowMs ?? DEFAULT_PORT_PROBE_WINDOW_MS}ms; standing down`)
     ;(deps.clearFile ?? clearFile)(pidFile)
     return { supervised: false, reason: 'port-busy' }
@@ -660,25 +583,35 @@ export async function main(argv, deps = {}) {
   // filesystem, and this function's contract is to RETURN an exit code. An
   // unguarded throw would become an unhandled rejection in a hidden login
   // process, which is invisible to the user.
+  const runSuperviseImpl = deps.runSupervise ?? runSupervise
   try {
     if (delayMs > 0) {
       const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
       log(`waiting ${delayMs}ms before the fallback attempt`)
       await sleep(delayMs)
     }
-    if (mode === 'start') {
-      await runStart({ config, log, deps, configPath, secondChance })
+    // `start` is kept as an alias: bootstrap.vbs is written at enable time and says
+    // `service.js start --config …`, so old installs must keep working without the user
+    // re-enabling autostart. `supervise` is the real entry point.
+    if (mode === 'start' || mode === 'supervise') {
+      const takeoverFlag = argv.indexOf('--takeover')
+      const takeoverRaw = takeoverFlag === -1 ? null : argv[takeoverFlag + 1]
+      const takeoverPid = takeoverRaw === null ? null : Number(takeoverRaw)
+      if (takeoverRaw !== null && (!Number.isInteger(takeoverPid) || takeoverPid <= 0)) return 2
+      // `deps` here is main's own parameter, not the seam bag the mode implementation wants —
+      // this function's argument IS the options object, so the bag has to be handed over under
+      // its own key explicitly. A `{ …, deps }` shorthand would bind to the parameter and the
+      // supervisor would silently lose every injected seam.
+      const modeDeps = deps.deps ?? {}
+      await runSuperviseImpl({ config, log, deps: modeDeps, configPath, takeoverPid })
       return 0
     }
     if (mode === 'restart') {
-      const pidFlag = argv.indexOf('--pid')
-      const oldPid = pidFlag === -1 ? Number.NaN : Number(argv[pidFlag + 1])
-      if (!Number.isInteger(oldPid) || oldPid <= 0) {
-        log('restart requires --pid <number>')
-        return 2
-      }
-      await runRestart({ config, oldPid, log, deps, configPath, secondChance })
-      return 0
+      // The mode is gone: DSH now hands the supervisor out of its job and writes a
+      // restart request instead. Refuse loudly — a silent 0 here would tell the caller
+      // DSH is coming back when nothing is going to start it.
+      log('restart is no longer a mode; use supervise --takeover <pid>')
+      return 2
     }
     return 2
   } catch (error) {
