@@ -804,11 +804,12 @@ test('runSupervise honours a requested restart even when a stop marker is alread
     assert.match(text, /restart requested for pid=111/)
     assert.match(text, /stop requested/)
     assert.equal(readPid(path.join(dir, 'restart.request')), null, 'the request must be consumed, not abandoned')
-    // `result.reason` is deliberately NOT pinned. With the marker pending from the start, the
-    // replacement start's own re-entrant superviseChild call (service.js:422 through :436) is the
-    // one that reaches the next exit, so it consumes the marker and returns `stopped`, and the
-    // outer frame turns that into `restart-failed` (service.js:429-432). Pinning either string
-    // here would be pinning this frame's shape rather than the ordering property under test.
+    // The nested frame supervised the replacement and then ended it, so `!next.supervised` here is
+    // NOT "the replacement failed to start" — the `spawned dsh pid=222` / `port 3080 is up` lines
+    // above prove it started, ran, and only then exited. The outer frame must not contradict them.
+    assert.doesNotMatch(text, /replacement did not come up/, 'the replacement did come up: do not say otherwise')
+    assert.match(text, /replacement stopped; supervisor exiting/)
+    assert.equal(result.reason, 'stopped', 'the nested reason is propagated, not overwritten')
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
 

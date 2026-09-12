@@ -460,9 +460,19 @@ async function superviseChild(input) {
       takeoverPid: current,
     })
     if (!next.supervised || !next.pid) {
-      log('replacement did not come up; supervisor exiting')
+      // Do not read this from `!next.supervised` alone. The start recurses into superviseChild, so
+      // the frame that supervised the replacement and then ended it also returns `supervised:false`
+      // here — with `reason: 'stopped'`. Calling that "did not come up" would print a false line
+      // directly under the true `stop requested` one, about a replacement that demonstrably did
+      // start (the `spawned dsh` and `port is up` lines above it), in the user's only diagnostic.
+      // The nested reason is what tells the two apart, so it is propagated, not overwritten.
+      const reason = next.reason ?? 'restart-failed'
+      // Only these reasons mean the start itself failed; every other reason describes an end that
+      // came after a successful start.
+      const startFailed = ['start-failed', 'takeover-timeout', 'port-busy', 'already-running'].includes(reason)
+      log(startFailed ? 'replacement did not come up; supervisor exiting' : `replacement ${reason}; supervisor exiting`)
       clear(pidFile)
-      return { supervised: false, reason: 'restart-failed' }
+      return { supervised: false, reason }
     }
     current = next.pid
     currentChild = next.child
