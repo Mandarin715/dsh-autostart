@@ -15,7 +15,12 @@ import {
   configFilePath,
   logPaths,
   buildConfigFile,
+  restartRequestFile,
+  supervisePidFile,
+  superviseStopFile,
 } from './lib/config.js'
+import { readPid, writeRestartRequest } from './lib/supervise-state.js'
+import { defaultSupervisor, isProcessAlive, writeSuperviseStop } from './lib/supervise-launch.js'
 import {
   readRunValue,
   writeRunValue,
@@ -293,6 +298,32 @@ export async function buildState(deps) {
   }
 }
 
+/**
+ * Ask a live supervisor to stop — best effort, synchronously, and without waiting for it.
+ *
+ * Only a live pid is named: leaving a stop marker for a pid that is gone would be litter that a
+ * later supervisor might read. The pid written is the SUPERVISOR's, never this host's: the
+ * supervisor honours a stop marker only when it names itself (`isStopRequested`).
+ *
+ * Nothing here waits for the supervisor to exit, and that is deliberate. The supervisor reads
+ * the marker only AFTER its child (DSH) exits, so writing it while DSH is alive does not make
+ * the supervisor exit now — disabling autostart must not close the user's running DSH. Do not
+ * "fix" that by polling for the supervisor's death: a resident timer is exactly what this
+ * design removed. The marker is named for the moment DSH does go away.
+ */
+function stopLiveSupervisor({ dshHome, isAlive, read, write }) {
+  try {
+    const pid = read(supervisePidFile(dshHome))
+    if (pid === null || !isAlive(pid)) return null
+    write(superviseStopFile(dshHome), pid)
+    return pid
+  } catch {
+    // Best effort: a stop marker that could not be written must not fail a disable or an
+    // uninstall, both of which have already done their real work.
+    return null
+  }
+}
+
 /** Build the four route handlers with injectable seams for tests. */
 export function createHandlers(deps) {
   const platform = deps.platform ?? process.platform
@@ -302,6 +333,21 @@ export function createHandlers(deps) {
   const fsImpl = deps.fs ?? fs
   const probe = deps.isPortListening ?? isPortListening
   const spawnHelper = deps.spawnHelper ?? defaultSpawnHelper
+  const readPidImpl = deps.readPid ?? readPid
+  const isProcessAliveImpl = deps.isProcessAlive ?? isProcessAlive
+  const writeSuperviseStopImpl = deps.writeSuperviseStop ?? writeSuperviseStop
+  const writeRestartRequestImpl = deps.writeRestartRequest ?? writeRestartRequest
+  // The supervisor is one per dsh home. Its pid-wait seams live in a bag of their own so a test
+  // can make the launch wait deterministic without spelling out every unrelated handler seam.
+  const supervisor =
+    deps.supervisor ??
+    defaultSupervisor(dshHome, {
+      execPath: deps.execPath ?? process.execPath,
+      serviceJsPath: deps.serviceJsPath ?? SERVICE_JS,
+      configPath: configFilePath(dshHome),
+      spawnHelper,
+      ...(deps.supervise ?? {}),
+    })
   let restarting = false
 
   const send = (res, code, payload) => {
@@ -388,6 +434,15 @@ export function createHandlers(deps) {
           return
         }
         registry.removeRunValue()
+        // The supervisor reads this marker only after its child exits, so writing it does not
+        // close the running DSH now (see stopLiveSupervisor). It stops a supervisor started by
+        // "restart" from lingering forever after its child is gone. Never awaited.
+        stopLiveSupervisor({
+          dshHome,
+          isAlive: isProcessAliveImpl,
+          read: readPidImpl,
+          write: writeSuperviseStopImpl,
+        })
         send(res, 200, { enabled: false })
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
@@ -401,10 +456,9 @@ export function createHandlers(deps) {
         send(res, 409, { error: 'a restart is already scheduled' })
         return
       }
-      // The detach helper exists only once autostart has been enabled: `enable`
-      // is what writes config.json, and service.js restart exits 1 without it.
-      // Spawning anyway would exit this host and leave nothing behind, i.e.
-      // "restart" would silently mean "shut down". §7 has a row for this
+      // The supervisor is what restarts DSH now, and it reads config.json to learn the launch
+      // command. Without the file it can only exit 1, leaving nothing to bring DSH back, so a
+      // restart that exits this host would silently mean "shut down". §7 has a row for this
       // ("请先启用自启"); the card also disables the button, this is the backstop.
       if (!fsImpl.existsSync(configFilePath(dshHome))) {
         send(res, 400, { error: 'enable autostart first: config.json is missing' })
@@ -418,32 +472,34 @@ export function createHandlers(deps) {
         send(res, 409, { error: `refusing to restart: ${detail}` })
         return
       }
-      // The flag is set BEFORE the await, not after. spawnHelper is async now, so
-      // setting it afterwards would leave an interleaving point where two
-      // overlapping POSTs both pass the check above, launch two helpers, and arm
-      // two exits — which spec §7 forbids ("a restart is already scheduled").
+      // The flag is set BEFORE the await, not after. `start` and the request write are async,
+      // so setting it afterwards would leave an interleaving point where two overlapping POSTs
+      // both pass the check above, launch two supervisors, and arm two exits — which spec §7
+      // forbids ("a restart is already scheduled").
       restarting = true
+      const selfPid = deps.currentPid ?? process.pid
       try {
-        // Awaited on purpose: the launcher runs inside DSH's job, so it must
-        // finish handing the helper to the WMI service BEFORE this host exits.
-        // Fire-and-forget would let the exit kill the launcher mid-call, leaving
-        // nothing behind to bring DSH back.
-        //
-        // configPath is passed explicitly rather than left to the helper: the WMI
-        // boundary drops this process's environment, so DSH_HOME would be absent
-        // and the helper would fall back to ~/.dsh and read the wrong config.
-        // Derived from the resolved dshHome, so a deps.dshHome override is honoured.
-        await spawnHelper({
-          execPath: deps.execPath ?? process.execPath,
-          serviceJsPath: deps.serviceJsPath ?? SERVICE_JS,
-          oldPid: deps.currentPid ?? process.pid,
-          configPath: configFilePath(dshHome),
-        })
+        // The order is the whole point: make sure something will take over BEFORE this host
+        // goes away. If no supervisor can be started, the catch below refuses with 500 and the
+        // host stays up — an exit with nobody to restart us is exactly the failure this design
+        // exists to remove.
+        if (!supervisor.isAlive()) {
+          // Bounded inside (10s): it throws rather than waiting forever, and the launcher it
+          // runs is awaited on purpose — the relay runs inside DSH's job, so it has to finish
+          // handing the supervisor out of that job BEFORE the exit that would kill it.
+          await supervisor.start(selfPid)
+        }
+        // Only now, with a live supervisor confirmed, is the request written. It names THIS
+        // process: the supervisor honours a request only for the child it just saw exit, and
+        // that child is this pid. Same path source as the supervisor's own derivation, so the
+        // request cannot land in a file nobody watches (lib/config.js restartRequestFile).
+        writeRestartRequestImpl(restartRequestFile(dshHome), selfPid)
       } catch (error) {
-        // Clear the flag so the user can retry: nothing was started, and the host
-        // is still alive to serve the next request.
+        // Covers both a supervisor that could not be started (including one whose pid never
+        // appeared) and a request that could not be written: in either case nothing will take
+        // over, so the host must stay up and the user must be able to retry.
         restarting = false
-        send(res, 500, { error: `could not start the restart helper: ${messageOf(error)}` })
+        send(res, 500, { error: `could not start the supervisor: ${messageOf(error)}` })
         return
       }
       send(res, 202, { accepted: true, runningAgents: running })
@@ -472,6 +528,9 @@ export function cleanupAutostart(deps) {
   const registry = deps.registry ?? { readRunValue, removeRunValue }
   const exists = deps.exists ?? fs.existsSync
   const serviceJsPath = deps.serviceJsPath ?? SERVICE_JS
+  const readPidImpl = deps.readPid ?? readPid
+  const isProcessAliveImpl = deps.isProcessAlive ?? isProcessAlive
+  const writeSuperviseStopImpl = deps.writeSuperviseStop ?? writeSuperviseStop
   const vbsPath = path.join(configDir(dshHome), 'bootstrap.vbs')
   let stored
   try {
@@ -486,6 +545,15 @@ export function cleanupAutostart(deps) {
   } catch {
     // best effort on unload
   }
+  // A real uninstall: the entry is gone, so the supervisor that was started on demand should
+  // not outlive its purpose. Same "write it and move on" rule as disable — the marker carries
+  // the supervisor's pid and is read only after its child exits (see stopLiveSupervisor).
+  stopLiveSupervisor({
+    dshHome,
+    isAlive: isProcessAliveImpl,
+    read: readPidImpl,
+    write: writeSuperviseStopImpl,
+  })
 }
 
 /** Cordis row entry: mount the four routes on the web server. */

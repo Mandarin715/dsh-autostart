@@ -10,6 +10,9 @@ function ourEntry(overrides = {}) {
   return {
     dshHome: 'C:\\dsh',
     serviceJsPath: SERVICE_JS,
+    // These tests are not about the stop marker that cleanup now writes; the pid read is
+    // doubled so they never look at a real `C:\dsh\dsh-autostart\supervise.pid`.
+    readPid: () => null,
     registry: {
       readRunValue: () => `wscript.exe "${VBS}"`,
       removeRunValue: () => {

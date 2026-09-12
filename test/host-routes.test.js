@@ -1,6 +1,34 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { sameOrigin, createHandlers } from '../index.js'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { sameOrigin, createHandlers, cleanupAutostart } from '../index.js'
+import { defaultSupervisor, isProcessAlive } from '../lib/supervise-launch.js'
+import {
+  configFilePath,
+  configDir,
+  restartRequestFile,
+  supervisePidFile,
+  superviseStopFile,
+} from '../lib/config.js'
+import { readPid, writePid } from '../lib/supervise-state.js'
+import { registryCommand } from '../lib/registry.js'
+
+/** A dsh home that matches the `C:\\dsh` used throughout this file. */
+const HOME = 'C:\\dsh'
+
+/** A pid that is never a real process: it only ever travels through injected seams. */
+const SUPERVISOR_PID = 4321
+
+/** Make a throwable with a chosen `code`, so the ESRCH/EPERM rule can be pinned. */
+function throwCode(code) {
+  return () => {
+    const error = new Error(code)
+    error.code = code
+    throw error
+  }
+}
 
 function fakeRes() {
   return {
@@ -305,4 +333,313 @@ test('disable leaves a foreign registry entry alone', async () => {
   const payload = JSON.parse(res.body)
   assert.equal(payload.enabled, true)
   assert.equal(payload.foreignEntry, true)
+})
+
+// ------------------------------------------------------- restart: hand over first
+
+/**
+ * Handler deps for the restart route: config.json reports present and every dangerous seam is
+ * doubled. `spawnHelper` throws, so a test that reaches it proves a seam it expected to be
+ * used was not.
+ */
+function restartRouteDeps(overrides = {}) {
+  return {
+    platform: 'win32',
+    dshHome: HOME,
+    fs: { existsSync: () => true },
+    spawnHelper: () => {
+      throw new Error('must not launch a real helper in this test')
+    },
+    scheduleExit: () => {},
+    ...overrides,
+  }
+}
+
+test('restart refuses and stays alive when no supervisor can be started', async () => {
+  // The whole point of the new order: nothing may exit before a supervisor is confirmed,
+  // because an exit with nobody to restart DSH is the exact failure this design removes.
+  const written = []
+  const exits = []
+  const handlers = createHandlers(
+    restartRouteDeps({
+      currentPid: 1234,
+      supervisor: {
+        isAlive: () => false,
+        start: async () => {
+          throw new Error('launcher exited 1')
+        },
+      },
+      writeRestartRequest: (file, pid) => written.push([file, pid]),
+      scheduleExit: (fn) => exits.push(fn),
+    }),
+  )
+  const res = fakeRes()
+  await handlers.restart(fakeReq(), res)
+  assert.equal(res.statusCode, 500)
+  assert.match(res.body, /could not start the supervisor/)
+  assert.deepEqual(written, [], 'no request may be written when nobody will take over')
+  assert.deepEqual(exits, [], 'DSH must not be asked to exit when nothing will take over')
+})
+
+test('restart writes a request naming this process and only then arms the exit', async () => {
+  const order = []
+  const handlers = createHandlers(
+    restartRouteDeps({
+      currentPid: 4321,
+      supervisor: {
+        isAlive: () => true,
+        start: async () => {
+          order.push('start')
+        },
+      },
+      writeRestartRequest: (file, pid) => order.push(['request', file, pid]),
+      scheduleExit: () => order.push('exit'),
+    }),
+  )
+  const res = fakeRes()
+  await handlers.restart(fakeReq(), res)
+  assert.equal(res.statusCode, 202)
+  // One assertion, three pins: nothing started a second supervisor, the request names THIS
+  // pid (the supervisor honours only a request naming the child it saw exit), it lands on the
+  // path the supervisor itself derives, and the exit comes last.
+  assert.deepEqual(order, [['request', restartRequestFile(HOME), 4321], 'exit'])
+})
+
+test('restart starts a supervisor that is not alive, naming this process as the takeover pid', async () => {
+  const started = []
+  const handlers = createHandlers(
+    restartRouteDeps({
+      currentPid: 4321,
+      supervisor: {
+        isAlive: () => false,
+        start: async (pid) => started.push(pid),
+      },
+    }),
+  )
+  const res = fakeRes()
+  await handlers.restart(fakeReq(), res)
+  assert.equal(res.statusCode, 202)
+  assert.deepEqual(started, [4321], 'the supervisor is told which DSH it must take over from')
+})
+
+test('the three state files are derived from the directory config.json lives in', () => {
+  // R2, the silent failure this pins down: the supervisor computes its three files as
+  // path.dirname(configPath) from the --config path it is handed. If the route's idea of that
+  // directory drifts, restart.request lands in a file nobody watches and the restart simply
+  // never happens — no error anywhere.
+  const dir = path.dirname(configFilePath(HOME))
+  assert.equal(dir, configDir(HOME))
+  assert.equal(restartRequestFile(HOME), path.join(dir, 'restart.request'))
+  assert.equal(supervisePidFile(HOME), path.join(dir, 'supervise.pid'))
+  assert.equal(superviseStopFile(HOME), path.join(dir, 'supervise.stop'))
+})
+
+// ------------------------------------------------------- supervisor launcher
+
+test('defaultSupervisor.isAlive is true only for a live pid in supervise.pid', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-sup-alive-'))
+  try {
+    fs.mkdirSync(configDir(dir), { recursive: true })
+    // No pid file at all: nothing to take over from.
+    assert.equal(defaultSupervisor(dir, { isAlive: () => true }).isAlive(), false)
+    // The pid is read from the real file the supervisor writes; liveness is injected so no
+    // real process is ever signalled.
+    writePid(supervisePidFile(dir), SUPERVISOR_PID)
+    assert.equal(defaultSupervisor(dir, { isAlive: () => false }).isAlive(), false)
+    assert.equal(
+      defaultSupervisor(dir, { isAlive: (pid) => pid === SUPERVISOR_PID }).isAlive(),
+      true,
+    )
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test(
+  'starting a supervisor waits, on the injected clock, for a live supervise.pid',
+  { timeout: 1000 },
+  async () => {
+    // The budget is the point: this test must fail rather than hang if the wait regresses
+    // into a real poll of a real clock.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-start-'))
+    try {
+      let ticks = 0
+      let launched = null
+      const supervisor = defaultSupervisor(dir, {
+        spawnHelper: (input) => {
+          launched = input
+        },
+        // The launch is what makes the pid appear: the first check sees nothing, the poll
+        // after the launch sees a live pid. No filesystem, no real process, no real seconds.
+        readPid: () => (ticks === 0 ? null : SUPERVISOR_PID),
+        isAlive: () => true,
+        now: () => ticks,
+        sleep: async () => {
+          ticks += 1
+        },
+        timeoutMs: 10,
+        intervalMs: 1,
+      })
+      assert.equal(supervisor.isAlive(), false)
+      assert.equal(await supervisor.start(4321), SUPERVISOR_PID)
+      assert.equal(ticks, 1, 'the wait must poll once and then find the pid, not sleep a fixed wait')
+      assert.equal(launched.takeoverPid, 4321, 'the helper key is takeoverPid, not oldPid')
+      assert.equal(launched.configPath, configFilePath(dir))
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  },
+)
+
+test(
+  'starting a supervisor times out with an error that says what it saw',
+  { timeout: 1000 },
+  async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-start-timeout-'))
+    try {
+      const advancingClock = () => {
+        let tick = 0
+        return () => (tick += 1000)
+      }
+      const never = defaultSupervisor(dir, {
+        spawnHelper: () => {},
+        readPid: () => null,
+        isAlive: () => true,
+        now: advancingClock(),
+        sleep: async () => {},
+        timeoutMs: 10000,
+      })
+      await assert.rejects(
+        () => never.start(4321),
+        (error) => {
+          assert.match(error.message, /did not come up within 10000ms/)
+          assert.match(error.message, /supervise\.pid was not written/, 'the error must name what it saw')
+          return true
+        },
+      )
+      const dead = defaultSupervisor(dir, {
+        spawnHelper: () => {},
+        readPid: () => SUPERVISOR_PID,
+        isAlive: () => false,
+        now: advancingClock(),
+        sleep: async () => {},
+        timeoutMs: 10000,
+      })
+      await assert.rejects(
+        () => dead.start(4321),
+        (error) => {
+          assert.match(error.message, new RegExp(`supervise\\.pid names pid ${SUPERVISOR_PID}`))
+          assert.match(error.message, /not alive/)
+          return true
+        },
+      )
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  },
+)
+
+test('the supervisor liveness rule is the codebase rule: only ESRCH means gone', () => {
+  // Same function the supervisor uses (service.js defaultIsAlive), pinned here because the
+  // restart route relies on it too. A false "gone" would let a second supervisor start over a
+  // live one.
+  assert.equal(isProcessAlive(SUPERVISOR_PID, () => {}), true)
+  assert.equal(isProcessAlive(SUPERVISOR_PID, throwCode('EPERM')), true, 'EPERM is a live process we may not signal')
+  assert.equal(isProcessAlive(SUPERVISOR_PID, throwCode('ESRCH')), false)
+})
+
+// ------------------------------------------------------- stop marker
+
+test('disable writes supervise.stop naming the live supervisor, without waiting for it', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-stop-'))
+  try {
+    fs.mkdirSync(configDir(dir), { recursive: true })
+    const vbsPath = path.join(configDir(dir), 'bootstrap.vbs')
+    const removed = []
+    writePid(supervisePidFile(dir), SUPERVISOR_PID)
+    const handlers = createHandlers({
+      platform: 'win32',
+      dshHome: dir,
+      registry: {
+        readRunValue: () => registryCommand(vbsPath),
+        removeRunValue: () => removed.push('removed'),
+      },
+      isProcessAlive: (pid) => pid === SUPERVISOR_PID,
+    })
+    const res = fakeRes()
+    // Deliberately NOT awaited. The supervisor reads this marker only after its child exits,
+    // so the route must write it and move on: an `await` before the write (a poll for the
+    // supervisor's death, say) would leave the marker unwritten here, and a marker poll is
+    // the resident timer this design removed.
+    const pending = handlers.disable(fakeReq(), res)
+    assert.equal(readPid(superviseStopFile(dir)), SUPERVISOR_PID)
+    assert.notEqual(readPid(superviseStopFile(dir)), process.pid, 'never the host pid')
+    assert.deepEqual(removed, ['removed'], 'the registry entry is still removed')
+    await pending
+    assert.equal(res.statusCode, 200)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('disable writes no stop marker when the pid file names nothing alive', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-stop-none-'))
+  try {
+    fs.mkdirSync(configDir(dir), { recursive: true })
+    const vbsPath = path.join(configDir(dir), 'bootstrap.vbs')
+    const registry = {
+      readRunValue: () => registryCommand(vbsPath),
+      removeRunValue: () => {},
+    }
+    // No supervise.pid: nothing to stop.
+    const noPid = createHandlers({ platform: 'win32', dshHome: dir, registry })
+    await noPid.disable(fakeReq(), fakeRes())
+    assert.equal(fs.existsSync(superviseStopFile(dir)), false)
+    // A pid file naming a process that is not alive: leaving it a marker would be litter.
+    writePid(supervisePidFile(dir), SUPERVISOR_PID)
+    const dead = createHandlers({
+      platform: 'win32',
+      dshHome: dir,
+      registry,
+      isProcessAlive: () => false,
+    })
+    await dead.disable(fakeReq(), fakeRes())
+    assert.equal(fs.existsSync(superviseStopFile(dir)), false)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('cleanupAutostart stops a live supervisor only on a real uninstall', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-autostart-stop-uninstall-'))
+  try {
+    fs.mkdirSync(configDir(dir), { recursive: true })
+    const vbsPath = path.join(configDir(dir), 'bootstrap.vbs')
+    const installed = path.join(dir, 'installed', 'service.js')
+    fs.mkdirSync(path.dirname(installed), { recursive: true })
+    fs.writeFileSync(installed, '', 'utf8')
+    writePid(supervisePidFile(dir), SUPERVISOR_PID)
+    const removed = []
+    const deps = {
+      dshHome: dir,
+      serviceJsPath: installed,
+      registry: {
+        readRunValue: () => registryCommand(vbsPath),
+        removeRunValue: () => removed.push('removed'),
+      },
+      isProcessAlive: (pid) => pid === SUPERVISOR_PID,
+    }
+    // Still installed: disposal is a reload, not an uninstall. The entry AND the supervisor
+    // must both survive, or every plugin reload kills the user's DSH.
+    cleanupAutostart(deps)
+    assert.deepEqual(removed, [], 'a reload must not remove the entry')
+    assert.equal(fs.existsSync(superviseStopFile(dir)), false, 'a reload must not stop the supervisor')
+    // Really uninstalled: our service.js is gone.
+    fs.rmSync(installed, { force: true })
+    cleanupAutostart(deps)
+    assert.deepEqual(removed, ['removed'])
+    assert.equal(readPid(superviseStopFile(dir)), SUPERVISOR_PID)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })

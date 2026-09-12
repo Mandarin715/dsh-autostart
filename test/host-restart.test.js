@@ -5,7 +5,8 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { buildLauncherArgv } from '../lib/launch-helper.js'
+import { buildLauncherArgv, buildHelperCommandLine } from '../lib/launch-helper.js'
+import { configFilePath } from '../lib/config.js'
 import {
   createHandlers,
   countRunningAgents,
@@ -31,11 +32,18 @@ const req = () => ({
 })
 
 /**
- * Handler deps that let the restart path reach the spawn step: the fs double
- * reports config.json as present, and every dangerous seam is a throwing
- * double so a regression cannot reach the real filesystem or exit anything.
+ * Handler deps that let the restart path reach the launch step: the fs double reports
+ * config.json as present, and every dangerous seam is a throwing double so a regression cannot
+ * reach the real filesystem or exit anything.
+ *
+ * `supervise.readPid` models the supervisor appearing: the first read (the route's "is a
+ * supervisor already alive?" check) finds nothing, every later read (the launch wait) finds a
+ * live pid. That is what the real WMI launcher achieves, and it keeps these tests off both the
+ * filesystem and the clock. `isAlive` is injected true for the same reason — the pid is a
+ * literal that never names a real process.
  */
 function restartDeps(overrides = {}) {
+  let pidReads = 0
   return {
     platform: 'win32',
     dshHome: 'C:\\dsh',
@@ -45,6 +53,11 @@ function restartDeps(overrides = {}) {
     fs: { existsSync: () => true },
     spawnHelper: () => {},
     scheduleExit: () => {},
+    supervise: {
+      readPid: () => (pidReads++ === 0 ? null : 4321),
+      isAlive: () => true,
+      sleep: async () => {},
+    },
     ...overrides,
   }
 }
@@ -117,7 +130,7 @@ test('restart spawns the helper with the current pid', async () => {
   await handlers.restart(req(), res)
   assert.equal(res.statusCode, 202)
   assert.equal(calls.length, 1)
-  assert.equal(calls[0].oldPid, 4321)
+  assert.equal(calls[0].takeoverPid, 4321)
   assert.equal(exits, 1)
 })
 
@@ -293,7 +306,7 @@ test('defaultSpawnHelper launches the helper through the WMI service', async () 
   // inside DSH's kill-on-close job, which is what turned "restart" into
   // "shut down".
   let captured = null
-  await defaultSpawnHelper(spawnInput({ oldPid: 99 }), {
+  await defaultSpawnHelper(spawnInput(), {
     spawnLauncher: (command, args, options) => {
       captured = { command, args, options }
       return fakeLauncher()
@@ -447,6 +460,37 @@ test('restart passes the host-resolved config path to the helper', async () => {
   await handlers.restart(req(), res)
   assert.equal(res.statusCode, 202)
   assert.equal(seen.configPath, 'C:\\custom home\\dsh-autostart\\config.json')
+})
+
+test('the launch input the restart route builds satisfies buildHelperCommandLine', async () => {
+  // Why the oldPid/takeoverPid break shipped green: every route test stubbed the launch with
+  // `spawnHelper: () => {}` (or captured the object and asserted its fields), so nothing ever
+  // handed that object to the function that consumes it. lib/launch-helper.js validates
+  // `takeoverPid`, so at HEAD this input carried `oldPid` and the real route answered 500 with
+  // "takeoverPid must be a positive integer, got undefined". This test walks the input across
+  // the file boundary: capture what the route hands to the WMI relay, then run it through the
+  // real builder. A rename back to `oldPid` — or any other key mismatch — fails here.
+  let input = null
+  const handlers = createHandlers(
+    restartDeps({
+      currentPid: 4321,
+      spawnHelper: (captured) => {
+        input = captured
+      },
+      scheduleExit: () => {},
+    }),
+  )
+  const res = fakeRes()
+  await handlers.restart(req(), res)
+  assert.equal(res.statusCode, 202, 'the route must reach the launch step')
+  assert.ok(input, 'the route must hand an input to the WMI relay')
+  const commandLine = buildHelperCommandLine(input)
+  assert.match(commandLine, /--takeover 4321/)
+  // The supervisor derives supervise.pid / restart.request / supervise.stop from
+  // path.dirname(configPath). Handing it anything but the very config.json the route's own
+  // paths are derived from would leave a request in a file nobody watches.
+  assert.equal(input.configPath, configFilePath('C:\\dsh'))
+  assert.equal(input.takeoverPid, 4321, 'the helper reads takeoverPid, not oldPid')
 })
 
 test('two overlapping restarts launch exactly one helper', async () => {
