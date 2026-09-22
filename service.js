@@ -267,7 +267,10 @@ async function waitForFreePort(probe, port, deps = {}) {
  * and this process stood down, or that a supervised DSH has since exited and the story ended.
  */
 export async function runSupervise(input) {
-  const { config, configPath, log } = input
+  // `let`, not `const`: the launch command is re-read from disk before every spawn. See the
+  // reload at the top of the start loop.
+  const { configPath, log } = input
+  let config = input.config
   const deps = input.deps ?? {}
   const probe = deps.isPortListening ?? isPortListening
   const wait = deps.waitForPort ?? waitForPort
@@ -338,6 +341,25 @@ export async function runSupervise(input) {
   // loop breaks early — and service.log is the only diagnostic the user has.
   let spawned = 0
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    // Re-read the launch command before every spawn — including the re-entrant restart path,
+    // which reaches this function through superviseChild.
+    //
+    // Holding the startup copy for the whole life of the process meant an edited config.json
+    // never reached the replacement: re-enabling autostart after an upgrade rewrote the file,
+    // the card's Restart brought DSH back up, and it came back on the OLD version. Measured on a
+    // real machine on 2026-09-22 while switching 0.1.5-rc.2 -> 0.1.6-alpha.2: the switch reported
+    // success and 3080 was still serving the previous build.
+    //
+    // A failed re-read keeps the last good config rather than refusing to start, so a
+    // config.json that is briefly unreadable cannot turn into DSH staying down.
+    if (configPath) {
+      try {
+        config = (deps.readConfig ?? readConfig)(configPath)
+      } catch (error) {
+        const why = error instanceof Error ? error.message : String(error)
+        log(`cannot re-read ${configPath}: ${why}; keeping the last good config`)
+      }
+    }
     // A previous child may still hold the port.
     if (attempt > 1 || input.takeoverPid) {
       const free = await waitForFreePort(probe, config.dshPort, deps)

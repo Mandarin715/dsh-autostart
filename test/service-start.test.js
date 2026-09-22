@@ -74,6 +74,75 @@ function writeTempConfig(dir) {
   return configPath
 }
 
+/** Deps that let runSupervise reach its spawn once and then end, with `seen` recording the argv. */
+function spawnCapture(seen, childPid) {
+  return {
+    anotherSupervisorAlive: () => false,
+    writePid: () => {},
+    clearFile: () => {},
+    isPortListening: async () => false,
+    waitForPort: async () => true,
+    runHook: async () => ({ ran: false }),
+    isProcessAlive: () => true,
+    consumeRestartRequest: () => false,
+    isStopRequested: () => false,
+    spawnDsh: (config) => {
+      seen.push(config.command.argv[0])
+      return fakeChild(childPid)
+    },
+  }
+}
+
+test('runSupervise re-reads config.json so an edited launch command is the one spawned', async () => {
+  // The supervisor used to keep the copy it read at startup for its whole life, so the card's
+  // Restart ignored an edited launch command and brought the OLD version back up. Measured on a
+  // real machine on 2026-09-22 while switching 0.1.5-rc.2 -> 0.1.6-alpha.2: the switch reported
+  // success while 3080 still served the previous build.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-reread-'))
+  const configPath = path.join(dir, 'config.json')
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify(
+      baseConfig({
+        command: { execPath: 'node.exe', argv: ['new-bin.js', 'web', '--no-open'], cwd: 'C:\\new' },
+      }),
+    ),
+    'utf8',
+  )
+
+  const seen = []
+  const result = await runSupervise({
+    // Deliberately stale: what a long-lived supervisor would still be holding in memory.
+    config: baseConfig({
+      command: { execPath: 'node.exe', argv: ['old-bin.js', 'web', '--no-open'], cwd: 'C:\\old' },
+    }),
+    configPath,
+    log: () => {},
+    deps: spawnCapture(seen, 4242),
+  })
+
+  assert.deepEqual(seen, ['new-bin.js'])
+  assert.equal(result.supervised, true)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('runSupervise keeps the last good config when config.json cannot be re-read', async () => {
+  // A config.json that is briefly unreadable must not turn into DSH staying down.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-reread-missing-'))
+  const seen = []
+  await runSupervise({
+    config: baseConfig({
+      command: { execPath: 'node.exe', argv: ['kept-bin.js', 'web'], cwd: 'C:\\kept' },
+    }),
+    configPath: path.join(dir, 'not-written-yet.json'),
+    log: () => {},
+    deps: spawnCapture(seen, 4243),
+  })
+
+  assert.deepEqual(seen, ['kept-bin.js'])
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 test('runHook is a no-op without a hookScript', async () => {
   const result = await runHook(baseConfig(), () => {}, {})
   assert.deepEqual(result, { ran: false })
