@@ -28,7 +28,7 @@ import {
   isOurEntry,
   registryCommand,
 } from './lib/registry.js'
-import { detectCommand } from './lib/detect-command.js'
+import { detectCommand, mergeDetectedCommand } from './lib/detect-command.js'
 import { parseLatestAccessUrl } from './lib/parse-url.js'
 import { renderBootstrapVbs as renderBootstrap } from './lib/render-vbs.js'
 import {
@@ -339,6 +339,25 @@ function stopLiveSupervisor({ dshHome, isAlive, read, write }) {
   }
 }
 
+/**
+ * The `command` block of an existing config.json, or null when there is none to trust.
+ *
+ * Read defensively: a config.json that is missing, half-written, or from an older schema must
+ * not fail an enable. It only means there is nothing to carry over.
+ */
+function readExistingCommand(configFile, fsImpl) {
+  try {
+    const parsed = JSON.parse(fsImpl.readFileSync(configFile, 'utf8'))
+    const command = parsed?.command
+    if (typeof command?.execPath !== 'string' || command.execPath === '') return null
+    if (typeof command?.cwd !== 'string' || command.cwd === '') return null
+    if (!Array.isArray(command.argv) || command.argv.length === 0) return null
+    return command
+  } catch {
+    return null
+  }
+}
+
 /** Build the four route handlers with injectable seams for tests. */
 export function createHandlers(deps) {
   const platform = deps.platform ?? process.platform
@@ -398,12 +417,20 @@ export function createHandlers(deps) {
     async enable(req, res) {
       if (!guard(req, res)) return
       try {
-        const command = detectCommand({
-          execPath: deps.execPath ?? process.execPath,
-          argv: deps.argv ?? process.argv.slice(1),
-          cwd: deps.cwd ?? process.cwd(),
-          openBrowser: pluginConfig.openBrowserOnBoot,
-        })
+        // Re-enabling is not a redefinition of how DSH is launched. The live process is not
+        // necessarily the one that should run at login, and its `cwd` is only whatever directory
+        // the shell that started it happened to be in. The capture that already worked wins, and
+        // only the entry point is refreshed — see mergeDetectedCommand for the incident.
+        const existing = readExistingCommand(configFilePath(dshHome), fsImpl)
+        const command = mergeDetectedCommand(
+          existing,
+          detectCommand({
+            execPath: deps.execPath ?? process.execPath,
+            argv: deps.argv ?? process.argv.slice(1),
+            cwd: deps.cwd ?? process.cwd(),
+            openBrowser: pluginConfig.openBrowserOnBoot,
+          }),
+        )
         const dir = configDir(dshHome)
         fsImpl.mkdirSync(dir, { recursive: true })
         const configFile = buildConfigFile({ command, pluginConfig, dshHome })

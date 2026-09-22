@@ -253,6 +253,86 @@ test('enable writes config, vbs and the registry entry', async () => {
   assert.deepEqual(registryCalls, ['C:\\dsh\\dsh-autostart\\bootstrap.vbs'])
 })
 
+test('enable on a first run detects the command from the live process', async () => {
+  const written = {}
+  const handlers = createHandlers({
+    platform: 'win32',
+    config: { dshPort: 3080 },
+    dshHome: 'C:\\dsh',
+    serviceJsPath: 'C:\\p\\service.js',
+    execPath: 'node.exe',
+    argv: ['C:\\bin.js', 'web'],
+    cwd: 'C:\\work',
+    fs: {
+      mkdirSync: () => {},
+      // No config.json yet: the read must not fail the enable.
+      readFileSync: () => {
+        throw new Error('ENOENT')
+      },
+      writeFileSync: (file, data) => {
+        written[file] = data
+      },
+    },
+    registry: { writeRunValue: () => {} },
+  })
+  const res = fakeRes()
+  await handlers.enable(fakeReq(), res)
+  assert.equal(res.statusCode, 200)
+  const config = JSON.parse(written['C:\\dsh\\dsh-autostart\\config.json'])
+  assert.equal(config.command.cwd, 'C:\\work')
+  assert.deepEqual(config.command.argv, ['C:\\bin.js', 'web', '--no-open'])
+})
+
+test('enable keeps the captured working directory and flags instead of re-deriving them', async () => {
+  // The live process is a one-off run out of C:\Users\asus. It may refresh the DSH entry
+  // point, but it must not redefine the boot workspace or drop the --trusted-host flags:
+  // that pair is exactly what put the session list up empty and broke remote access.
+  const written = {}
+  const previous = {
+    schemaVersion: 1,
+    command: {
+      execPath: 'node.exe',
+      argv: [
+        'C:\\old\\bin.js',
+        'web',
+        '--trusted-host',
+        'mandarin.example.ts.net',
+        '--no-open',
+      ],
+      cwd: 'C:\\Users\\asus\\Desktop\\Mandarin',
+    },
+  }
+  const handlers = createHandlers({
+    platform: 'win32',
+    config: { dshPort: 3080 },
+    dshHome: 'C:\\dsh',
+    serviceJsPath: 'C:\\p\\service.js',
+    execPath: 'node.exe',
+    argv: ['C:\\new\\bin.js', 'web'],
+    cwd: 'C:\\Users\\asus',
+    fs: {
+      mkdirSync: () => {},
+      readFileSync: () => JSON.stringify(previous),
+      writeFileSync: (file, data) => {
+        written[file] = data
+      },
+    },
+    registry: { writeRunValue: () => {} },
+  })
+  const res = fakeRes()
+  await handlers.enable(fakeReq(), res)
+  assert.equal(res.statusCode, 200)
+  const config = JSON.parse(written['C:\\dsh\\dsh-autostart\\config.json'])
+  assert.equal(config.command.cwd, 'C:\\Users\\asus\\Desktop\\Mandarin')
+  assert.deepEqual(config.command.argv, [
+    'C:\\new\\bin.js',
+    'web',
+    '--no-open',
+    '--trusted-host',
+    'mandarin.example.ts.net',
+  ])
+})
+
 test('enable reports a registry write failure with the security-software hint', async () => {
   // §7 row 2: the registry-write failure message must name the likely cause.
   const handlers = createHandlers({
