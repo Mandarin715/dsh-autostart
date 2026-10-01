@@ -64,7 +64,12 @@ DSH 配置依赖环境变量,请留意这一点,并尽量让 `command.execPath` 
 ## 安装
 
 ```sh
-dsh plugin --profile web add github:Mandarin715/dsh-autostart
+# 固定版本（推荐）：装的是与作者本机一致、已验证过的那一版
+dsh plugin --profile web add "github:Mandarin715/dsh-autostart#v0.2.1"
+```
+
+> 想要 main 上的最新修复（可能尚未验证）：
+> `dsh plugin --profile web add "github:Mandarin715/dsh-autostart"`
 ```
 
 重启 DSH 后,进入「设置 → 通用设置」,拉到最下方即可看到本插件的卡片。

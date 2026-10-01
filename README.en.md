@@ -66,7 +66,12 @@ and prefer an absolute `command.execPath`.
 ## Install
 
 ```sh
-dsh plugin --profile web add github:Mandarin715/dsh-autostart
+# Pinned release (recommended): the exact version verified on the author's machine
+dsh plugin --profile web add "github:Mandarin715/dsh-autostart#v0.2.1"
+```
+
+> Want the latest fixes from main (may be unverified)?
+> `dsh plugin --profile web add "github:Mandarin715/dsh-autostart"`
 ```
 
 Restart DSH, then open Settings → General and scroll to the bottom to find this plugin's card.
