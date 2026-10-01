@@ -459,7 +459,13 @@ async function superviseChild(input) {
         clear(pidFile)
         return { supervised: false, reason: 'stopped' }
       }
-      log(`dsh pid=${current} exited without a restart request; nothing to do`)
+      // 2026-09-27 维护会话补丁:原来这行只说 "exited",于是 DSH 自己死掉时我们既不知道它是被
+      // 外部杀掉(signal / 负 exitCode),还是自己主动退出(code 0) —— 白丢一次取证机会。
+      // 只加信息,不改任何行为(这个分支原来干什么,现在还干什么)。
+      log(
+        `dsh pid=${current} exited without a restart request; nothing to do` +
+          ` [exitCode=${currentChild?.exitCode ?? 'null'} signal=${currentChild?.signalCode ?? 'null'}]`,
+      )
       clear(pidFile)
       return { supervised: true, pid: current, child: currentChild }
     }
